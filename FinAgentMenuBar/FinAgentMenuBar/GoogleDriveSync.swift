@@ -2,8 +2,9 @@
 //  GoogleDriveSync.swift
 //  FinAgentMenuBar
 //
-//  Mirrors the per-day JSON to Google Drive — the only way the data leaves this
-//  app's sandbox container, and how a dashboard/agent gets at it.
+//  Legacy mirror of the per-day JSON to Google Drive. Cloud Storage
+//  (GCSSync) is the default. This stays so an existing Drive folder can be
+//  copied once, then removed.
 //
 //  The local container stays the source of truth: FinAgentDataManager does its
 //  read-merge-write on disk exactly as before, and every file it touches is
@@ -18,7 +19,7 @@ import Foundation
 import Combine
 
 @MainActor
-final class GoogleDriveSync: ObservableObject {
+final class GoogleDriveSync: ObservableObject, DayFileMirror {
     static let shared = GoogleDriveSync()
 
     private let auth = GoogleDriveAuth.shared
@@ -286,6 +287,31 @@ final class GoogleDriveSync: ObservableObject {
         }
 
         status = result
+    }
+
+    /// Download every day JSON file in the configured Drive folder.
+    func downloadDayFiles() async throws -> [(day: String, name: String, data: Data)] {
+        guard auth.isConnected else { throw GoogleDriveError.notConnected }
+        let client = GoogleDriveClient { force in
+            try await GoogleDriveAuth.shared.validAccessToken(forceRefresh: force)
+        }
+        guard let root = try await client.fileId(named: folderName, parent: "root", isFolder: true) else {
+            return []
+        }
+        let dayFolders = try await client.childFolders(of: root)
+        let dayNameById = Dictionary(dayFolders.compactMap { folder in
+            folder.name.map { (folder.id, $0) }
+        }, uniquingKeysWith: { first, _ in first })
+
+        var downloaded: [(day: String, name: String, data: Data)] = []
+        for file in try await client.allFiles() {
+            guard let name = file.name, name.hasSuffix(".json"),
+                  let day = file.parents?.compactMap({ dayNameById[$0] }).first,
+                  DayFileLayout.isDayFolder(day) else { continue }
+            let data = try await client.download(id: file.id)
+            downloaded.append((day: day, name: name, data: data))
+        }
+        return downloaded
     }
 
     /// Every `YYYY-MM-DD/<name>.json` currently on disk.

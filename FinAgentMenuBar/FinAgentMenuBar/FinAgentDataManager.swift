@@ -107,8 +107,11 @@ class FinAgentDataManager: ObservableObject {
     static let shared = FinAgentDataManager()
 
     private let apiManager = APIKeyManager.shared
-    let driveSync = GoogleDriveSync.shared
-    private let environment: PlaidEnvironment = .production
+    /// Cloud Storage is the default mirror. Drive remains in the project for a one-time copy.
+    let cloudSync = GCSSync.shared
+    /// Read on every request from the environment saved with the credentials,
+    /// so an update applies on the next pull without restarting the app.
+    private var environment: PlaidEnvironment { apiManager.plaidEnvironment }
 
     @Published var lastAPICall: Date?
     @Published var errorMessage: String?
@@ -191,6 +194,14 @@ class FinAgentDataManager: ObservableObject {
         sweepOrphanedData()
     }
 
+    /// User-facing Plaid failure text, including the host that was called.
+    private func describe(_ error: Error) -> String {
+        let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        let prefix = "\(environment.displayName):"
+        if text.hasPrefix(prefix) { return text }
+        return "\(prefix) \(text)"
+    }
+
     // MARK: - Plaid Data Pull
 
     // Ensures the automatic launch pull happens at most once per launch.
@@ -238,7 +249,7 @@ class FinAgentDataManager: ObservableObject {
                 if !labeled.data.hardErrors.isEmpty { failureCount += 1 }
             } catch {
                 // Credential/decryption failure — the whole token can't be pulled.
-                labeled.errorMessage = (error as? PlaidAPIError)?.errorDescription ?? error.localizedDescription
+                labeled.errorMessage = describe(error)
                 failureCount += 1
                 print("Plaid refresh error [\(entry.label)]: \(error)")
             }
@@ -247,8 +258,8 @@ class FinAgentDataManager: ObservableObject {
         }
 
         // Mirror everything this run touched (plus anything still queued from a
-        // previous failed attempt) up to Google Drive.
-        await driveSync.flush(localRoot: dataDirectoryURL)
+        // previous failed attempt) up to Cloud Storage.
+        await cloudSync.flush(localRoot: dataDirectoryURL)
 
         snapshots = results
         lastAPICall = Date()
@@ -571,7 +582,7 @@ class FinAgentDataManager: ObservableObject {
             let data = try Self.recordEncoder.encode(record)
             try data.write(to: url, options: .atomic)
             // Queue the mirror; the actual upload happens once per run in flush().
-            driveSync.markWritten(day: record.date, fileName: url.lastPathComponent)
+            cloudSync.markWritten(day: record.date, fileName: url.lastPathComponent)
         } catch {
             print("Daily export failed [\(record.date)/\(record.label)]: \(error)")
         }
@@ -594,17 +605,20 @@ class FinAgentDataManager: ObservableObject {
     }
 
     /// Delete shared credentials + every token, then clear all local data.
-    /// The Google Drive grant goes too — it's stored under the same key.
+    /// The Drive grant and the Cloud Storage service-account key go too.
     func resetAll() async {
         stopAutoRotate()
-        // Revoke while the session can still decrypt the refresh token, and
-        // before the sweep queues deletions against an account we're leaving.
+        // Revoke Drive while the session can still decrypt the refresh token,
+        // and before the sweep queues deletions against an account we're leaving.
         await GoogleDriveAuth.shared.reset()
-        driveSync.isEnabled = false
+        GoogleDriveSync.shared.isEnabled = false
+        GCSAuth.shared.clear()
+        cloudSync.isEnabled = false
         await apiManager.deleteKeys()
         sweepOrphanedData() // tokenEntries is now empty, so this clears everything
         // After the sweep, so the deletions it queues don't outlive the reset.
-        driveSync.reset()
+        GoogleDriveSync.shared.reset()
+        cloudSync.reset()
     }
 
     /// Delete the persisted cursor, cached snapshot, and every day file for one token.
@@ -643,22 +657,22 @@ class FinAgentDataManager: ObservableObject {
                 let url = dayDir.appendingPathComponent(file)
                 if let record = readRecord(at: url), shouldRemove(record) {
                     try? fm.removeItem(at: url)
-                    // Propagate the deletion, so Drive doesn't keep data for a
-                    // token that's been removed here.
-                    driveSync.markDeleted(day: dayName, fileName: file)
+                    // Propagate the deletion so Cloud Storage doesn't keep data
+                    // for a token that's been removed here.
+                    cloudSync.markDeleted(day: dayName, fileName: file)
                 }
             }
             // Remove the day folder if it's now empty.
             if let remaining = try? fm.contentsOfDirectory(atPath: dayDir.path), remaining.isEmpty {
                 try? fm.removeItem(at: dayDir)
-                driveSync.markDayRemoved(day: dayName)
+                cloudSync.markDayRemoved(day: dayName)
             }
         }
 
         // Deletions are queued from synchronous call sites (init, removeToken),
         // so push them out of band rather than blocking the caller.
         let root = dataDirectoryURL
-        Task { await driveSync.flush(localRoot: root) }
+        Task { await cloudSync.flush(localRoot: root) }
     }
 
     // MARK: - Access Token Rotation
@@ -682,12 +696,12 @@ class FinAgentDataManager: ObservableObject {
             errorMessage = nil
             return true
         } catch let apiError as PlaidAPIError {
-            errorMessage = "\(entry.label): \(apiError.errorDescription ?? "rotation failed")"
+            errorMessage = "\(entry.label): \(describe(apiError))"
             statusMessage = "Rotation failed"
             print("Rotation error [\(entry.label)]: \(apiError.errorCode ?? "?") — \(apiError.errorMessage ?? "")")
             return false
         } catch {
-            errorMessage = "\(entry.label): \(error.localizedDescription)"
+            errorMessage = "\(entry.label): \(describe(error))"
             statusMessage = "Rotation failed"
             print("Rotation error [\(entry.label)]: \(error)")
             return false

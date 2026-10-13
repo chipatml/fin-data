@@ -1,14 +1,18 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var manager = FinAgentDataManager.shared
     @StateObject private var apiManager = APIKeyManager.shared
+    @StateObject private var gcsAuth = GCSAuth.shared
+    @StateObject private var gcsSync = GCSSync.shared
     @StateObject private var driveAuth = GoogleDriveAuth.shared
     @StateObject private var driveSync = GoogleDriveSync.shared
 
     // Shared credential inputs
     @State private var clientIdInput = ""
     @State private var secretInput = ""
+    @State private var setupEnvironment: PlaidEnvironment = .production
 
     // New access token inputs
     @State private var tokenLabelInput = ""
@@ -17,6 +21,14 @@ struct ContentView: View {
     // Update-shared-credentials inputs
     @State private var updateClientIdInput = ""
     @State private var updateSecretInput = ""
+    @State private var updateEnvironment: PlaidEnvironment = .production
+
+    // Cloud Storage service-account key. Held only in this view until Save,
+    // then wiped. The persisted copy is in the Keychain.
+    @State private var serviceAccountJSON = ""
+    @State private var replacementKeyJSON = ""
+    @State private var importKeyFile = false
+    @State private var importReplacementKey = false
 
     // Google Drive OAuth client inputs
     @State private var driveClientIdInput = ""
@@ -25,7 +37,16 @@ struct ContentView: View {
     @State private var status: String = ""
 
     private var canSaveShared: Bool {
-        !clientIdInput.isEmpty && !secretInput.isEmpty
+        !clientIdInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !secretInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canUpdateCredentials: Bool {
+        let clientId = updateClientIdInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secret = updateSecretInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasClientId = !clientId.isEmpty || apiManager.hasStoredClientId(for: updateEnvironment)
+        let hasSecret = !secret.isEmpty || apiManager.hasStoredSecret(for: updateEnvironment)
+        return hasClientId && hasSecret
     }
     private var canAddToken: Bool {
         !tokenLabelInput.isEmpty && !tokenValueInput.isEmpty
@@ -134,6 +155,8 @@ struct ContentView: View {
             Text("Enter your Plaid credentials")
                 .font(.headline)
 
+            environmentPicker(selection: $setupEnvironment)
+
             SecureField("client_id", text: $clientIdInput)
                 .textFieldStyle(.roundedBorder)
             SecureField("secret", text: $secretInput)
@@ -143,7 +166,8 @@ struct ContentView: View {
                 Task {
                     await apiManager.storeSharedCredentials(
                         clientId: clientIdInput,
-                        secret: secretInput
+                        secret: secretInput,
+                        environment: setupEnvironment
                     )
                     clientIdInput = ""
                     secretInput = ""
@@ -175,6 +199,18 @@ struct ContentView: View {
             Label(status, systemImage: "checkmark.shield.fill")
                 .foregroundColor(.green)
                 .font(.headline)
+
+            Text("Plaid environment: \(apiManager.plaidEnvironment.displayName) (\(apiManager.plaidEnvironment.hostDescription))")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if apiManager.usesUnlabeledLegacySecret {
+                Text("The saved secret is not tied to Sandbox or Production. Pulls still send it to Production until you choose the matching environment below and save that client_id and secret.")
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             tokenList
             addTokenForm
@@ -213,7 +249,12 @@ struct ContentView: View {
                 Label("Open Data Folder", systemImage: "folder")
             }
 
-            DisclosureGroup("Google Drive") {
+            DisclosureGroup("Cloud Storage") {
+                cloudStorageControls
+            }
+            .font(.subheadline)
+
+            DisclosureGroup("Google Drive (legacy)") {
                 driveControls
             }
             .font(.subheadline)
@@ -249,9 +290,19 @@ struct ContentView: View {
 
     private var updateCredentialsControls: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Apply a secret rotated in the Plaid Dashboard. Leave a field blank to keep it. Tokens are preserved.")
+            Text("Sandbox and Production each keep their own client_id and secret. A blank field keeps the value already saved for the environment selected here. Tokens are preserved.")
                 .font(.caption2)
                 .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            environmentPicker(selection: $updateEnvironment)
+
+            if !apiManager.hasStoredSecret(for: updateEnvironment) {
+                Text(updateSecretHint)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             TextField("client_id", text: $updateClientIdInput)
                 .textFieldStyle(.roundedBorder)
@@ -262,20 +313,300 @@ struct ContentView: View {
                 Task {
                     await apiManager.updateSharedCredentials(
                         clientId: updateClientIdInput,
-                        secret: updateSecretInput
+                        secret: updateSecretInput,
+                        environment: updateEnvironment
                     )
                     updateSecretInput = ""
+                    updateClientIdInput = apiManager.currentClientId(for: updateEnvironment) ?? updateClientIdInput
                 }
             }
-            .disabled(updateClientIdInput.isEmpty && updateSecretInput.isEmpty)
+            .disabled(!canUpdateCredentials)
+
+            if let error = apiManager.errorMessage {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if apiManager.statusMessage.hasPrefix("Credentials updated") {
+                Text(apiManager.statusMessage)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.top, 4)
         .onAppear {
-            // Pre-fill the current client_id for convenience.
+            updateEnvironment = apiManager.plaidEnvironment
             if updateClientIdInput.isEmpty {
-                updateClientIdInput = apiManager.currentClientId() ?? ""
+                updateClientIdInput = apiManager.currentClientId(for: updateEnvironment) ?? ""
             }
         }
+        .onChange(of: updateEnvironment) { _, newEnvironment in
+            updateClientIdInput = apiManager.currentClientId(for: newEnvironment) ?? ""
+            updateSecretInput = ""
+        }
+    }
+
+    private var updateSecretHint: String {
+        if updateEnvironment == .production && apiManager.usesUnlabeledLegacySecret {
+            return "No Production-specific secret is saved. Until you save Sandbox or Production credentials here, pulls still send the previously saved secret to Production."
+        }
+        return "No secret is saved for \(updateEnvironment.displayName) yet. Paste that environment's secret. A secret saved for another environment is not reused."
+    }
+
+    private func environmentPicker(selection: Binding<PlaidEnvironment>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Environment")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Picker("Environment", selection: selection) {
+                Text("Sandbox").tag(PlaidEnvironment.sandbox)
+                Text("Production").tag(PlaidEnvironment.production)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Text("\(selection.wrappedValue.displayName) uses \(selection.wrappedValue.hostDescription).")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    // MARK: - Cloud Storage controls
+
+    private var cloudStorageControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !gcsAuth.isConfigured {
+                cloudStorageSetup
+            } else {
+                cloudStorageConnected
+            }
+            if let error = gcsAuth.errorMessage ?? gcsSync.errorMessage {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private var cloudStorageSetup: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Paste or import a GCP service account JSON key. It is stored in the Keychain, not in this repo. The bucket name is saved in settings.")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            TextEditor(text: $serviceAccountJSON)
+                .font(.system(.caption2, design: .monospaced))
+                .frame(minHeight: 72)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
+
+            Button("Import JSON Key…") { importKeyFile = true }
+                .font(.caption)
+
+            TextField("bucket name", text: $gcsSync.bucketName)
+                .textFieldStyle(.roundedBorder)
+            HStack(spacing: 4) {
+                Text("Prefix")
+                    .font(.caption)
+                TextField(GCSSync.defaultPrefix, text: $gcsSync.prefix)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+            Text(objectLayoutCaption)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button("Save Service Account") {
+                let json = serviceAccountJSON
+                Task {
+                    if await gcsAuth.save(json: json) {
+                        serviceAccountJSON = ""
+                        gcsSync.isEnabled = true
+                        await gcsSync.syncAll(localRoot: manager.dataDirectoryURL)
+                    }
+                }
+            }
+            .disabled(serviceAccountJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      || gcsSync.bucketName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .fileImporter(isPresented: $importKeyFile, allowedContentTypes: [.json]) { result in
+            loadKeyFile(result, into: $serviceAccountJSON)
+        }
+    }
+
+    private var cloudStorageConnected: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(gcsAuth.clientEmail ?? "Service account saved", systemImage: "externaldrive.fill.badge.checkmark")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(2)
+
+            Toggle("Upload day files to Cloud Storage", isOn: $gcsSync.isEnabled)
+                .font(.caption)
+
+            TextField("bucket name", text: $gcsSync.bucketName)
+                .textFieldStyle(.roundedBorder)
+            HStack(spacing: 4) {
+                Text("Prefix")
+                    .font(.caption)
+                TextField(GCSSync.defaultPrefix, text: $gcsSync.prefix)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+            Text(objectLayoutCaption)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if gcsSync.pendingCount > 0 {
+                Text("\(gcsSync.pendingCount) file(s) waiting to upload")
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+            } else if let last = gcsSync.lastSync {
+                Text("Last upload: \(last.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+            Button(gcsSync.isSyncing ? "Uploading…" : "Sync All to Cloud Storage") {
+                Task { await gcsSync.syncAll(localRoot: manager.dataDirectoryURL) }
+            }
+            .disabled(gcsSync.isSyncing || gcsSync.isMigrating || !gcsSync.isEnabled)
+            .help("Upload every day file currently on disk, then retry anything still queued.")
+
+            Button {
+                Task { await gcsSync.checkStatus(localRoot: manager.dataDirectoryURL) }
+            } label: {
+                Label(gcsSync.isCheckingStatus ? "Checking…" : "Check Cloud Storage Status",
+                      systemImage: "stethoscope")
+            }
+            .disabled(gcsSync.isCheckingStatus || gcsSync.isSyncing)
+
+            if let status = gcsSync.status {
+                cloudStatusReport(status)
+            }
+
+            DisclosureGroup("Update service account key") {
+                Text("Replaces the Keychain copy. The bucket name is unchanged unless you edit it above.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                TextEditor(text: $replacementKeyJSON)
+                    .font(.system(.caption2, design: .monospaced))
+                    .frame(minHeight: 64)
+                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
+                Button("Import JSON Key…") { importReplacementKey = true }
+                    .font(.caption)
+                Button("Update Credential") {
+                    let json = replacementKeyJSON
+                    Task {
+                        if await gcsAuth.save(json: json) {
+                            replacementKeyJSON = ""
+                        }
+                    }
+                }
+                .disabled(replacementKeyJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .font(.caption)
+            .fileImporter(isPresented: $importReplacementKey, allowedContentTypes: [.json]) { result in
+                loadKeyFile(result, into: $replacementKeyJSON)
+            }
+
+            Button(gcsSync.isMigrating ? "Copying…" : "Copy Drive files into the bucket") {
+                Task { await gcsSync.importFromDrive(localRoot: manager.dataDirectoryURL) }
+            }
+            .disabled(gcsSync.isMigrating || gcsSync.isSyncing || !driveAuth.isConnected)
+            .help("Uploads the local Data folder, then downloads any remaining day files from the connected Drive account.")
+
+            Text("If Drive is already disconnected, upload the local folder instead:")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(GCSSync.migrationCommand(bucket: gcsSync.bucketName, prefix: gcsSync.prefix))
+                .font(.system(.caption2, design: .monospaced))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button("Remove Service Account", role: .destructive) {
+                gcsAuth.clear()
+                gcsSync.isEnabled = false
+                gcsSync.reset()
+                serviceAccountJSON = ""
+                replacementKeyJSON = ""
+            }
+            .font(.caption)
+        }
+    }
+
+    private var objectLayoutCaption: String {
+        let bucket = gcsSync.bucketName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = gcsSync.prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        let bucketLabel = bucket.isEmpty ? "BUCKET" : bucket
+        let prefixLabel = prefix.isEmpty ? GCSSync.defaultPrefix : prefix
+        return "gs://\(bucketLabel)/\(prefixLabel)/<YYYY-MM-DD>/<Label>.json"
+    }
+
+    private func loadKeyFile(_ result: Result<URL, Error>, into text: Binding<String>) {
+        switch result {
+        case .success(let url):
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            if let raw = try? String(contentsOf: url, encoding: .utf8) {
+                text.wrappedValue = raw
+                gcsAuth.errorMessage = nil
+            } else {
+                gcsAuth.errorMessage = "Could not read that file as UTF-8 text."
+            }
+        case .failure(let error):
+            gcsAuth.errorMessage = error.localizedDescription
+        }
+    }
+
+    @ViewBuilder
+    private func cloudStatusReport(_ status: GCSSync.Status) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let error = status.errorMessage {
+                Label("Check failed", systemImage: "xmark.octagon.fill")
+                    .font(.caption).bold()
+                    .foregroundColor(.red)
+                Text(error)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if status.inSync {
+                Label("IN SYNC", systemImage: "checkmark.seal.fill")
+                    .font(.caption).bold()
+                    .foregroundColor(.green)
+                Text("\(status.remoteFiles) file(s) across \(status.remoteDays) day(s) in the bucket.")
+            } else {
+                Label("OUT OF SYNC", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).bold()
+                    .foregroundColor(.orange)
+                Text("Local \(status.localFiles) file(s) / \(status.localDays) day(s) · Cloud Storage \(status.remoteFiles) / \(status.remoteDays)")
+                if !status.missing.isEmpty {
+                    Text("• \(status.missing.count) missing from the bucket — “Sync All” uploads them")
+                        .foregroundColor(.orange)
+                }
+                if !status.extra.isEmpty {
+                    Text("• \(status.extra.count) extra in the bucket with no local file")
+                }
+                if status.queued > 0 {
+                    Text("• \(status.queued) queued for the next upload")
+                }
+                ForEach((status.missing + status.extra).prefix(3), id: \.self) { path in
+                    Text("   \(path)")
+                        .foregroundColor(.secondary)
+                }
+            }
+            Text("Checked \(status.checkedAt.formatted(date: .omitted, time: .shortened))")
+                .foregroundColor(.secondary)
+        }
+        .font(.caption2)
+        .padding(6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08))
+        .cornerRadius(6)
     }
 
     // MARK: - Google Drive controls
