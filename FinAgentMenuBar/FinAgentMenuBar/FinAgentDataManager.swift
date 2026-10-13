@@ -109,7 +109,9 @@ class FinAgentDataManager: ObservableObject {
     private let apiManager = APIKeyManager.shared
     /// Cloud Storage is the default mirror. Drive remains in the project for a one-time copy.
     let cloudSync = GCSSync.shared
-    private let environment: PlaidEnvironment = .production
+    /// Read on every request from the environment saved with the credentials,
+    /// so an update applies on the next pull without restarting the app.
+    private var environment: PlaidEnvironment { apiManager.plaidEnvironment }
 
     @Published var lastAPICall: Date?
     @Published var errorMessage: String?
@@ -192,6 +194,14 @@ class FinAgentDataManager: ObservableObject {
         sweepOrphanedData()
     }
 
+    /// User-facing Plaid failure text, including the host that was called.
+    private func describe(_ error: Error) -> String {
+        let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        let prefix = "\(environment.displayName):"
+        if text.hasPrefix(prefix) { return text }
+        return "\(prefix) \(text)"
+    }
+
     // MARK: - Plaid Data Pull
 
     // Ensures the automatic launch pull happens at most once per launch.
@@ -239,7 +249,7 @@ class FinAgentDataManager: ObservableObject {
                 if !labeled.data.hardErrors.isEmpty { failureCount += 1 }
             } catch {
                 // Credential/decryption failure — the whole token can't be pulled.
-                labeled.errorMessage = (error as? PlaidAPIError)?.errorDescription ?? error.localizedDescription
+                labeled.errorMessage = describe(error)
                 failureCount += 1
                 print("Plaid refresh error [\(entry.label)]: \(error)")
             }
@@ -686,12 +696,12 @@ class FinAgentDataManager: ObservableObject {
             errorMessage = nil
             return true
         } catch let apiError as PlaidAPIError {
-            errorMessage = "\(entry.label): \(apiError.errorDescription ?? "rotation failed")"
+            errorMessage = "\(entry.label): \(describe(apiError))"
             statusMessage = "Rotation failed"
             print("Rotation error [\(entry.label)]: \(apiError.errorCode ?? "?") — \(apiError.errorMessage ?? "")")
             return false
         } catch {
-            errorMessage = "\(entry.label): \(error.localizedDescription)"
+            errorMessage = "\(entry.label): \(describe(error))"
             statusMessage = "Rotation failed"
             print("Rotation error [\(entry.label)]: \(error)")
             return false

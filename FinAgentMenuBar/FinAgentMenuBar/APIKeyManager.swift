@@ -22,13 +22,24 @@ class APIKeyManager: ObservableObject {
     /// the tokens themselves are encrypted in the keychain, keyed by id.
     @Published var tokenEntries: [PlaidTokenEntry] = []
 
+    /// Plaid host used by the next request. Saved in UserDefaults (not a secret).
+    /// Changing it does not move credentials between environments.
+    @Published var plaidEnvironment: PlaidEnvironment = .production {
+        didSet {
+            UserDefaults.standard.set(plaidEnvironment.rawValue, forKey: Self.plaidEnvironmentKey)
+        }
+    }
+
     private let enclaveLabel = "com.mlaid.finagent.apikey.enclave.master"
     // Keychain account for the biometry-gated Secure Enclave key's wrapped blob.
     private let enclaveKeyAccount = "com.mlaid.finagent.apikey.enclave.key.v2"
 
-    // Shared app-level Plaid credentials, each its own encrypted keychain item.
-    private let plaidClientIdAccount = "com.mlaid.finagent.plaid.client_id"
-    private let plaidSecretAccount = "com.mlaid.finagent.plaid.secret"
+    // Credentials saved before environments were split. The app always posted
+    // these to production.plaid.com. They are not copied into Sandbox: the
+    // last value written here may be a sandbox secret.
+    private let legacyClientIdAccount = "com.mlaid.finagent.plaid.client_id"
+    private let legacySecretAccount = "com.mlaid.finagent.plaid.secret"
+    private static let plaidEnvironmentKey = "com.mlaid.finagent.plaid.environment"
 
     // Per-token keychain accounts share this prefix; UserDefaults holds the metadata.
     private let accessTokenAccountPrefix = "com.mlaid.finagent.plaid.access_token."
@@ -43,25 +54,47 @@ class APIKeyManager: ObservableObject {
         accessTokenAccountPrefix + id
     }
 
+    private func clientIdAccount(for environment: PlaidEnvironment) -> String {
+        "com.mlaid.finagent.plaid.client_id.\(environment.rawValue)"
+    }
+
+    private func secretAccount(for environment: PlaidEnvironment) -> String {
+        "com.mlaid.finagent.plaid.secret.\(environment.rawValue)"
+    }
+
     init() {
         tokenEntries = loadTokenEntries()
+        if let raw = UserDefaults.standard.string(forKey: Self.plaidEnvironmentKey),
+           let stored = PlaidEnvironment(rawValue: raw),
+           PlaidEnvironment.settingsChoices.contains(stored) {
+            plaidEnvironment = stored
+        }
     }
 
     // MARK: - Shared Credentials (client_id + secret)
-    /// Encrypts and stores the shared app-level Plaid credentials. On first setup
+    /// Encrypts and stores Plaid credentials for `environment`. On first setup
     /// this creates the biometric Enclave key (one Touch ID prompt) and caches the
-    /// derived symmetric key for the session.
-    func storeSharedCredentials(clientId: String, secret: String) async {
+    /// derived symmetric key for the session. The next request uses `environment`
+    /// without an app restart.
+    func storeSharedCredentials(clientId: String, secret: String, environment: PlaidEnvironment) async {
+        let trimmedClientId = Self.trimmedCredential(clientId)
+        let trimmedSecret = Self.trimmedCredential(secret)
+        guard !trimmedClientId.isEmpty, !trimmedSecret.isEmpty else {
+            errorMessage = "Enter a \(environment.displayName) client_id and secret."
+            statusMessage = "Failed to store credentials"
+            return
+        }
         // Ensure the biometric key exists and the symmetric key is in memory.
         guard await authenticate(reason: "Set up FinAgent secure storage") else {
             return // errorMessage already set by authenticate()
         }
         do {
             let symmetricKey = try currentSymmetricKey()
-            try encryptAndStore(clientId, using: symmetricKey, account: plaidClientIdAccount)
-            try encryptAndStore(secret, using: symmetricKey, account: plaidSecretAccount)
+            try encryptAndStore(trimmedClientId, using: symmetricKey, account: clientIdAccount(for: environment))
+            try encryptAndStore(trimmedSecret, using: symmetricKey, account: secretAccount(for: environment))
+            plaidEnvironment = environment
 
-            statusMessage = "Credentials saved"
+            statusMessage = "Credentials saved for \(environment.displayName)"
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -69,19 +102,36 @@ class APIKeyManager: ObservableObject {
         }
     }
 
-    /// Updates the shared credentials in place, overwriting only the fields
-    /// provided (blank = keep existing). Access tokens are left untouched — use
-    /// this to apply a secret rotated in the Plaid Dashboard.
-    func updateSharedCredentials(clientId: String?, secret: String?) async {
+    /// Writes trimmed client_id/secret for `environment` and selects that host
+    /// for the next request. A blank field keeps the value already stored for
+    /// that same environment. A blank secret does not keep the unlabeled secret
+    /// from before environments were split, and it does not copy another
+    /// environment's secret. Access tokens are left untouched.
+    func updateSharedCredentials(clientId: String?, secret: String?, environment: PlaidEnvironment) async {
+        let trimmedClientId = Self.trimmedCredential(clientId ?? "")
+        let trimmedSecret = Self.trimmedCredential(secret ?? "")
+        // A blank client_id keeps the one already saved for this environment, or
+        // the unlabeled client_id so it can be copied into this environment.
+        // The secret is never copied across environments.
+        let resolvedClientId = trimmedClientId.isEmpty ? currentClientId(for: environment) : trimmedClientId
+        guard let resolvedClientId else {
+            errorMessage = "Enter the \(environment.displayName) client_id."
+            statusMessage = "Update failed"
+            return
+        }
+        guard !trimmedSecret.isEmpty || hasStoredSecret(for: environment) else {
+            errorMessage = "Enter the \(environment.displayName) secret. A blank field only keeps a secret already saved for \(environment.displayName)."
+            statusMessage = "Update failed"
+            return
+        }
         do {
             let symmetricKey = try currentSymmetricKey()
-            if let clientId, !clientId.isEmpty {
-                try encryptAndStore(clientId, using: symmetricKey, account: plaidClientIdAccount)
+            try encryptAndStore(resolvedClientId, using: symmetricKey, account: clientIdAccount(for: environment))
+            if !trimmedSecret.isEmpty {
+                try encryptAndStore(trimmedSecret, using: symmetricKey, account: secretAccount(for: environment))
             }
-            if let secret, !secret.isEmpty {
-                try encryptAndStore(secret, using: symmetricKey, account: plaidSecretAccount)
-            }
-            statusMessage = "Credentials updated"
+            plaidEnvironment = environment
+            statusMessage = "Credentials updated for \(environment.displayName). The next pull uses \(environment.hostDescription)."
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -89,10 +139,40 @@ class APIKeyManager: ObservableObject {
         }
     }
 
-    /// Current stored client_id, for pre-filling the update form. Nil if unavailable.
-    func currentClientId() -> String? {
+    /// client_id saved for `environment`, for pre-filling the update form.
+    /// Falls back to the unlabeled client_id so it can be saved into the
+    /// selected environment. Nil if unavailable.
+    func currentClientId(for environment: PlaidEnvironment) -> String? {
         guard let symmetricKey = try? currentSymmetricKey() else { return nil }
-        return try? decrypt(account: plaidClientIdAccount, using: symmetricKey)
+        if let stored = storedCredential(account: clientIdAccount(for: environment), using: symmetricKey) {
+            return stored
+        }
+        return storedCredential(account: legacyClientIdAccount, using: symmetricKey)
+    }
+
+    /// True when this environment has its own secret in the keychain.
+    /// The unlabeled legacy secret does not count.
+    func hasStoredSecret(for environment: PlaidEnvironment) -> Bool {
+        keychainItemExists(account: secretAccount(for: environment))
+    }
+
+    /// True when a client_id is available to save with `environment`: its own
+    /// slot, or the unlabeled client_id. Does not decrypt.
+    func hasStoredClientId(for environment: PlaidEnvironment) -> Bool {
+        keychainItemExists(account: clientIdAccount(for: environment))
+            || keychainItemExists(account: legacyClientIdAccount)
+    }
+
+    /// True when a complete client_id + secret pair is stored for `environment`.
+    func hasEnvironmentCredentials(_ environment: PlaidEnvironment) -> Bool {
+        keychainItemExists(account: clientIdAccount(for: environment))
+            && keychainItemExists(account: secretAccount(for: environment))
+    }
+
+    /// True when the only saved pair is the pre-environment slot, which this
+    /// app used to send to Production.
+    var usesUnlabeledLegacySecret: Bool {
+        hasLegacyCredentials() && !PlaidEnvironment.settingsChoices.contains(where: { self.hasEnvironmentCredentials($0) })
     }
 
     // MARK: - Access Tokens (multiple, each labeled)
@@ -102,7 +182,13 @@ class APIKeyManager: ObservableObject {
         do {
             let symmetricKey = try currentSymmetricKey()
             let entry = PlaidTokenEntry(label: label)
-            try encryptAndStore(token, using: symmetricKey, account: accessTokenAccount(for: entry.id))
+            let trimmedToken = Self.trimmedCredential(token)
+            guard !trimmedToken.isEmpty else {
+                errorMessage = "Enter an access token."
+                statusMessage = "Failed to add token"
+                return nil
+            }
+            try encryptAndStore(trimmedToken, using: symmetricKey, account: accessTokenAccount(for: entry.id))
 
             tokenEntries.append(entry)
             saveTokenEntries()
@@ -120,8 +206,10 @@ class APIKeyManager: ObservableObject {
     /// Overwrites the stored token for an existing entry, keeping its id + label.
     /// Used by token rotation.
     func updateAccessToken(id: String, token: String) throws {
+        let trimmedToken = Self.trimmedCredential(token)
+        guard !trimmedToken.isEmpty else { throw KeychainError.keyNotFound }
         let symmetricKey = try currentSymmetricKey()
-        try encryptAndStore(token, using: symmetricKey, account: accessTokenAccount(for: id))
+        try encryptAndStore(trimmedToken, using: symmetricKey, account: accessTokenAccount(for: id))
     }
 
     /// Removes the access token with the given id (keychain + metadata).
@@ -298,7 +386,11 @@ class APIKeyManager: ObservableObject {
 
     /// Wipes the shared credentials and every stored access token.
     public func deleteKeys() async {
-        var accounts = [plaidClientIdAccount, plaidSecretAccount]
+        var accounts = [legacyClientIdAccount, legacySecretAccount]
+        for environment in PlaidEnvironment.settingsChoices {
+            accounts.append(clientIdAccount(for: environment))
+            accounts.append(secretAccount(for: environment))
+        }
         accounts.append(contentsOf: tokenEntries.map { accessTokenAccount(for: $0.id) })
 
         for account in accounts {
@@ -307,6 +399,7 @@ class APIKeyManager: ObservableObject {
 
         tokenEntries.removeAll()
         saveTokenEntries()
+        plaidEnvironment = .production
         isUnlocked = false
         statusMessage = "Credentials deleted"
     }
@@ -319,10 +412,15 @@ class APIKeyManager: ObservableObject {
         SecItemDelete(query as CFDictionary)
     }
 
-    /// True when the shared client_id + secret are present.
+    /// True when some Plaid client_id + secret pair is present, including the
+    /// unlabeled pair saved before credentials were split by environment.
     func hasSharedCredentials() -> Bool {
-        keychainItemExists(account: plaidClientIdAccount)
-            && keychainItemExists(account: plaidSecretAccount)
+        hasLegacyCredentials() || PlaidEnvironment.settingsChoices.contains(where: { self.hasEnvironmentCredentials($0) })
+    }
+
+    private func hasLegacyCredentials() -> Bool {
+        keychainItemExists(account: legacyClientIdAccount)
+            && keychainItemExists(account: legacySecretAccount)
     }
 
     private func keychainItemExists(account: String) -> Bool {
@@ -370,14 +468,61 @@ class APIKeyManager: ObservableObject {
         return key
     }
 
-    /// Decrypts the shared credentials combined with the token for `id`.
+    /// Decrypts the credentials for the selected environment plus the token for `id`.
+    /// Read on every request, so an update applies without restarting the app.
     func credentials(forTokenId id: String) throws -> PlaidCredentials {
         let symmetricKey = try currentSymmetricKey()
-        return PlaidCredentials(
-            clientId: try decrypt(account: plaidClientIdAccount, using: symmetricKey),
-            secret: try decrypt(account: plaidSecretAccount, using: symmetricKey),
-            accessToken: try decrypt(account: accessTokenAccount(for: id), using: symmetricKey)
+        let pair = try credentialPair(for: plaidEnvironment, using: symmetricKey)
+        let accessToken = Self.trimmedCredential(
+            try decrypt(account: accessTokenAccount(for: id), using: symmetricKey)
         )
+        guard !accessToken.isEmpty else { throw KeychainError.keyNotFound }
+        return PlaidCredentials(
+            clientId: pair.clientId,
+            secret: pair.secret,
+            accessToken: accessToken
+        )
+    }
+
+    /// Per-environment pair. Production may still read the unlabeled pair, but
+    /// only while neither Sandbox nor Production has its own pair — that is the
+    /// install that has not re-saved since environments were split. After a
+    /// Sandbox (or Production) pair is saved, the unlabeled secret is not sent.
+    private func credentialPair(for environment: PlaidEnvironment, using symmetricKey: SymmetricKey) throws -> (clientId: String, secret: String) {
+        if let clientId = try trimmedStored(account: clientIdAccount(for: environment), using: symmetricKey),
+           let secret = try trimmedStored(account: secretAccount(for: environment), using: symmetricKey) {
+            return (clientId, secret)
+        }
+        let anyLabeledPair = PlaidEnvironment.settingsChoices.contains { hasEnvironmentCredentials($0) }
+        if environment == .production, !anyLabeledPair,
+           let clientId = try trimmedStored(account: legacyClientIdAccount, using: symmetricKey),
+           let secret = try trimmedStored(account: legacySecretAccount, using: symmetricKey) {
+            return (clientId, secret)
+        }
+        throw KeychainError.missingCredentials(environment: environment)
+    }
+
+    /// Nil when the account is absent or the stored value is only whitespace.
+    private func trimmedStored(account: String, using symmetricKey: SymmetricKey) throws -> String? {
+        do {
+            let trimmed = Self.trimmedCredential(try decrypt(account: account, using: symmetricKey))
+            return trimmed.isEmpty ? nil : trimmed
+        } catch KeychainError.keyNotFound {
+            return nil
+        }
+    }
+
+    private static func trimmedCredential(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Form prefill helper. Missing and unreadable values are both nil.
+    private func storedCredential(account: String, using symmetricKey: SymmetricKey) -> String? {
+        do {
+            return try trimmedStored(account: account, using: symmetricKey)
+        } catch {
+            return nil
+        }
     }
 
     private func decrypt(account: String, using symmetricKey: SymmetricKey) throws -> String {
@@ -406,6 +551,7 @@ enum KeychainError: Error, LocalizedError {
     case unableToDeleteKey(OSStatus)
     case secureEnclaveUnavailable
     case locked
+    case missingCredentials(environment: PlaidEnvironment)
     var errorDescription: String? {
         switch self {
         case .unableToCreateKey(let status): return "Failed to create Secure Enclave key (\(status))"
@@ -414,6 +560,8 @@ enum KeychainError: Error, LocalizedError {
         case .unableToDeleteKey(let status): return "Failed to delete Secure Enclave key (\(status))"
         case .secureEnclaveUnavailable:      return "Secure Enclave is not available on this device"
         case .locked:                        return "Locked — authenticate with Touch ID first"
+        case .missingCredentials(let environment):
+            return "\(environment.displayName): no client_id and secret are saved for this environment. Open Update client_id / secret, choose \(environment.displayName), and save them."
         }
     }
 }

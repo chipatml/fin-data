@@ -29,10 +29,24 @@ struct PlaidTokenEntry: Codable, Identifiable, Hashable {
     }
 }
 
-enum PlaidEnvironment {
+enum PlaidEnvironment: String, CaseIterable, Identifiable {
     case sandbox
     case development
     case production
+
+    var id: String { rawValue }
+
+    /// Environments the credential UI offers. Development remains only so older
+    /// hosts still have a URL if a caller names that case.
+    static let settingsChoices: [PlaidEnvironment] = [.sandbox, .production]
+
+    var displayName: String {
+        switch self {
+        case .sandbox: return "Sandbox"
+        case .development: return "Development"
+        case .production: return "Production"
+        }
+    }
 
     var baseURL: URL {
         switch self {
@@ -40,6 +54,10 @@ enum PlaidEnvironment {
         case .development: return URL(string: "https://development.plaid.com")!
         case .production:  return URL(string: "https://production.plaid.com")!
         }
+    }
+
+    var hostDescription: String {
+        baseURL.host ?? displayName
     }
 }
 
@@ -61,8 +79,32 @@ struct PlaidAPIError: Codable, Error, LocalizedError {
         case requestId = "request_id"
     }
 
+    /// Host the failing request was sent to. Not part of Plaid's JSON envelope.
+    var environment: PlaidEnvironment? = nil
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        errorType = try container.decodeIfPresent(String.self, forKey: .errorType)
+        errorCode = try container.decodeIfPresent(String.self, forKey: .errorCode)
+        errorMessage = try container.decodeIfPresent(String.self, forKey: .errorMessage)
+        displayMessage = try container.decodeIfPresent(String.self, forKey: .displayMessage)
+        requestId = try container.decodeIfPresent(String.self, forKey: .requestId)
+        environment = nil
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(errorType, forKey: .errorType)
+        try container.encodeIfPresent(errorCode, forKey: .errorCode)
+        try container.encodeIfPresent(errorMessage, forKey: .errorMessage)
+        try container.encodeIfPresent(displayMessage, forKey: .displayMessage)
+        try container.encodeIfPresent(requestId, forKey: .requestId)
+    }
+
     var errorDescription: String? {
-        displayMessage ?? errorMessage ?? errorCode ?? "Unknown Plaid error"
+        let detail = displayMessage ?? errorMessage ?? errorCode ?? "Unknown Plaid error"
+        guard let environment else { return detail }
+        return "\(environment.displayName): \(detail)"
     }
 
     /// True when the error means this product simply isn't available for the
@@ -86,15 +128,15 @@ struct PlaidAPIError: Codable, Error, LocalizedError {
 }
 
 enum PlaidClientError: Error, LocalizedError {
-    case invalidResponse
-    case http(status: Int, body: String)
+    case invalidResponse(environment: PlaidEnvironment)
+    case http(status: Int, body: String, environment: PlaidEnvironment)
 
     var errorDescription: String? {
         switch self {
-        case .invalidResponse:
-            return "Invalid response from Plaid"
-        case .http(let status, let body):
-            return "Plaid HTTP \(status): \(body)"
+        case .invalidResponse(let environment):
+            return "\(environment.displayName): Invalid response from Plaid"
+        case .http(let status, let body, let environment):
+            return "\(environment.displayName): Plaid HTTP \(status): \(body)"
         }
     }
 }
@@ -425,7 +467,7 @@ struct PlaidClient {
     private let decoder: JSONDecoder
 
     init(credentials: PlaidCredentials,
-         environment: PlaidEnvironment = .production,
+         environment: PlaidEnvironment,
          session: URLSession = .shared) {
         self.credentials = credentials
         self.environment = environment
@@ -528,16 +570,17 @@ struct PlaidClient {
         let (data, response) = try await session.data(for: request)
 
         guard let http = response as? HTTPURLResponse else {
-            throw PlaidClientError.invalidResponse
+            throw PlaidClientError.invalidResponse(environment: environment)
         }
 
         guard (200...299).contains(http.statusCode) else {
             // Plaid returns a structured error envelope on failure.
-            if let apiError = try? decoder.decode(PlaidAPIError.self, from: data) {
+            if var apiError = try? decoder.decode(PlaidAPIError.self, from: data) {
+                apiError.environment = environment
                 throw apiError
             }
             let bodyText = String(data: data, encoding: .utf8) ?? "<no body>"
-            throw PlaidClientError.http(status: http.statusCode, body: bodyText)
+            throw PlaidClientError.http(status: http.statusCode, body: bodyText, environment: environment)
         }
 
         return try decoder.decode(T.self, from: data)

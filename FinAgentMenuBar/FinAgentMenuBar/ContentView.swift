@@ -12,6 +12,7 @@ struct ContentView: View {
     // Shared credential inputs
     @State private var clientIdInput = ""
     @State private var secretInput = ""
+    @State private var setupEnvironment: PlaidEnvironment = .production
 
     // New access token inputs
     @State private var tokenLabelInput = ""
@@ -20,6 +21,7 @@ struct ContentView: View {
     // Update-shared-credentials inputs
     @State private var updateClientIdInput = ""
     @State private var updateSecretInput = ""
+    @State private var updateEnvironment: PlaidEnvironment = .production
 
     // Cloud Storage service-account key. Held only in this view until Save,
     // then wiped. The persisted copy is in the Keychain.
@@ -35,7 +37,16 @@ struct ContentView: View {
     @State private var status: String = ""
 
     private var canSaveShared: Bool {
-        !clientIdInput.isEmpty && !secretInput.isEmpty
+        !clientIdInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !secretInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canUpdateCredentials: Bool {
+        let clientId = updateClientIdInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secret = updateSecretInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasClientId = !clientId.isEmpty || apiManager.hasStoredClientId(for: updateEnvironment)
+        let hasSecret = !secret.isEmpty || apiManager.hasStoredSecret(for: updateEnvironment)
+        return hasClientId && hasSecret
     }
     private var canAddToken: Bool {
         !tokenLabelInput.isEmpty && !tokenValueInput.isEmpty
@@ -144,6 +155,8 @@ struct ContentView: View {
             Text("Enter your Plaid credentials")
                 .font(.headline)
 
+            environmentPicker(selection: $setupEnvironment)
+
             SecureField("client_id", text: $clientIdInput)
                 .textFieldStyle(.roundedBorder)
             SecureField("secret", text: $secretInput)
@@ -153,7 +166,8 @@ struct ContentView: View {
                 Task {
                     await apiManager.storeSharedCredentials(
                         clientId: clientIdInput,
-                        secret: secretInput
+                        secret: secretInput,
+                        environment: setupEnvironment
                     )
                     clientIdInput = ""
                     secretInput = ""
@@ -185,6 +199,18 @@ struct ContentView: View {
             Label(status, systemImage: "checkmark.shield.fill")
                 .foregroundColor(.green)
                 .font(.headline)
+
+            Text("Plaid environment: \(apiManager.plaidEnvironment.displayName) (\(apiManager.plaidEnvironment.hostDescription))")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if apiManager.usesUnlabeledLegacySecret {
+                Text("The saved secret is not tied to Sandbox or Production. Pulls still send it to Production until you choose the matching environment below and save that client_id and secret.")
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             tokenList
             addTokenForm
@@ -264,9 +290,19 @@ struct ContentView: View {
 
     private var updateCredentialsControls: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Apply a secret rotated in the Plaid Dashboard. Leave a field blank to keep it. Tokens are preserved.")
+            Text("Sandbox and Production each keep their own client_id and secret. A blank field keeps the value already saved for the environment selected here. Tokens are preserved.")
                 .font(.caption2)
                 .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            environmentPicker(selection: $updateEnvironment)
+
+            if !apiManager.hasStoredSecret(for: updateEnvironment) {
+                Text(updateSecretHint)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             TextField("client_id", text: $updateClientIdInput)
                 .textFieldStyle(.roundedBorder)
@@ -277,19 +313,61 @@ struct ContentView: View {
                 Task {
                     await apiManager.updateSharedCredentials(
                         clientId: updateClientIdInput,
-                        secret: updateSecretInput
+                        secret: updateSecretInput,
+                        environment: updateEnvironment
                     )
                     updateSecretInput = ""
+                    updateClientIdInput = apiManager.currentClientId(for: updateEnvironment) ?? updateClientIdInput
                 }
             }
-            .disabled(updateClientIdInput.isEmpty && updateSecretInput.isEmpty)
+            .disabled(!canUpdateCredentials)
+
+            if let error = apiManager.errorMessage {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if apiManager.statusMessage.hasPrefix("Credentials updated") {
+                Text(apiManager.statusMessage)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.top, 4)
         .onAppear {
-            // Pre-fill the current client_id for convenience.
+            updateEnvironment = apiManager.plaidEnvironment
             if updateClientIdInput.isEmpty {
-                updateClientIdInput = apiManager.currentClientId() ?? ""
+                updateClientIdInput = apiManager.currentClientId(for: updateEnvironment) ?? ""
             }
+        }
+        .onChange(of: updateEnvironment) { _, newEnvironment in
+            updateClientIdInput = apiManager.currentClientId(for: newEnvironment) ?? ""
+            updateSecretInput = ""
+        }
+    }
+
+    private var updateSecretHint: String {
+        if updateEnvironment == .production && apiManager.usesUnlabeledLegacySecret {
+            return "No Production-specific secret is saved. Until you save Sandbox or Production credentials here, pulls still send the previously saved secret to Production."
+        }
+        return "No secret is saved for \(updateEnvironment.displayName) yet. Paste that environment's secret. A secret saved for another environment is not reused."
+    }
+
+    private func environmentPicker(selection: Binding<PlaidEnvironment>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Environment")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Picker("Environment", selection: selection) {
+                Text("Sandbox").tag(PlaidEnvironment.sandbox)
+                Text("Production").tag(PlaidEnvironment.production)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Text("\(selection.wrappedValue.displayName) uses \(selection.wrappedValue.hostDescription).")
+                .font(.caption2)
+                .foregroundColor(.secondary)
         }
     }
 
