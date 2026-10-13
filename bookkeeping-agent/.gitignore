@@ -1,6 +1,22 @@
 .venv/
 venv/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 .DS_Store
+
+# Secrets. Commit .env.example only.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials.json
+*.postman_environment.json

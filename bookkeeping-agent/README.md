@@ -40,10 +40,11 @@ the row is still kept, with `account_*` fields left null.
 cd bookkeeping-agent
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export XAI_API_KEY=...          # preferred
-# or: export OPENAI_API_KEY=...
-export BOOKKEEPING_MODEL=grok-4 # optional
+cp .env.example .env            # gitignored; fill in keys locally
 ```
+
+`.env` is loaded automatically. `XAI_API_KEY` is preferred; `OPENAI_API_KEY` is the fallback.
+`BOOKKEEPING_MODEL` is optional (`grok-4` / `gpt-4o`). Shell exports override `.env`.
 
 ## Inspect without an LLM
 

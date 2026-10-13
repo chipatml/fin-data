@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
+from dotenv import load_dotenv
 from langchain.agents import create_agent
 
 from bookkeeping_agent.prompt import SYSTEM_PROMPT
 from bookkeeping_agent.tools import PLAID_TOOLS
+
+# bookkeeping-agent/.env, regardless of the process cwd. Existing env vars win.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 def _model():
