@@ -244,6 +244,9 @@ class FinAgentDataManager: ObservableObject {
             do {
                 let credentials = try apiManager.credentials(forTokenId: entry.id)
                 let client = PlaidClient(credentials: credentials, environment: environment)
+                // Key check does not send the access token, so INVALID_API_KEYS
+                // here is the client_id/secret pair and not a bad token.
+                try await client.verifyClientCredentials()
                 labeled.data = await fetchAll(using: client, tokenId: entry.id, since: lastDay)
                 // A token counts as failed only on a genuine (non-availability) error.
                 if !labeled.data.hardErrors.isEmpty { failureCount += 1 }
