@@ -338,8 +338,10 @@ class APIKeyManager: ObservableObject {
     // MARK: - Generic encrypted secrets
     //
     // Same envelope as the Plaid credentials — ChaChaPoly under the session key
-    // — for secrets owned by other subsystems (e.g. the Google Drive refresh
-    // token). Requires an unlocked session, like everything else here.
+    // — for secrets owned by other subsystems (the Google Drive refresh token
+    // and the Cloud Storage service-account JSON). Requires an unlocked
+    // session, like everything else here. The service-account key is never
+    // written to UserDefaults.
 
     /// Encrypt and persist `value` for `account`.
     func storeSecret(_ value: String, account: String) throws {

@@ -182,6 +182,16 @@ struct GoogleDriveClient {
         _ = try await send(request)
     }
 
+    /// Raw bytes of a file. Used by the one-time Drive → Cloud Storage copy.
+    func download(id: String) async throws -> Data {
+        var components = URLComponents(
+            url: Self.filesEndpoint.appendingPathComponent(id), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "alt", value: "media")]
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        return try await send(request)
+    }
+
     // MARK: - Delete
 
     /// Move a file or folder to the Drive trash. Recoverable, unlike an
