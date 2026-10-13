@@ -1,0 +1,10 @@
+{
+  "date": "2026-07-10",
+  "id": "tok_boa",
+  "label": "BOA",
+  "investmentTransactions": [],
+  "snapshot": null,
+  "transactions": [
+    {"transaction_id": "tx_grocery", "account_id": "acc_boa", "amount": 84.21, "date": "2026-07-10", "name": "WHOLEFDS MKT 123", "merchant_name": "Whole Foods Market", "pending": false, "iso_currency_code": "USD", "personal_finance_category": {"primary": "FOOD_AND_DRINK", "detailed": "FOOD_AND_DRINK_GROCERIES"}}
+  ]
+}

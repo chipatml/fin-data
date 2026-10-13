@@ -1,0 +1,69 @@
+{
+  "accounts": [
+    {
+      "account_id": "acc_visa",
+      "name": "Sapphire",
+      "type": "credit",
+      "subtype": "credit card",
+      "mask": "0091"
+    }
+  ],
+  "transactions": [
+    {
+      "transaction_id": "tx_netflix",
+      "account_id": "acc_visa",
+      "amount": 15.49,
+      "date": "2026-07-03",
+      "name": "NETFLIX.COM",
+      "merchant_name": "Netflix",
+      "pending": false,
+      "merchant_entity_id": "ent_netflix",
+      "iso_currency_code": "USD",
+      "personal_finance_category": {"primary": "ENTERTAINMENT", "detailed": "ENTERTAINMENT_TV_AND_MOVIES"}
+    },
+    {
+      "transaction_id": "tx_hulu",
+      "account_id": "acc_visa",
+      "amount": 17.99,
+      "date": "2026-07-05",
+      "name": "HULU",
+      "merchant_name": "Hulu",
+      "pending": false,
+      "iso_currency_code": "USD",
+      "personal_finance_category": {"primary": "ENTERTAINMENT", "detailed": "ENTERTAINMENT_TV_AND_MOVIES"}
+    },
+    {
+      "transaction_id": "tx_max",
+      "account_id": "acc_visa",
+      "amount": 16.99,
+      "date": "2026-07-06",
+      "name": "MAX.COM",
+      "merchant_name": "Max",
+      "pending": false,
+      "iso_currency_code": "USD",
+      "personal_finance_category": {"primary": "ENTERTAINMENT", "detailed": "ENTERTAINMENT_TV_AND_MOVIES"}
+    },
+    {
+      "transaction_id": "tx_sbux1",
+      "account_id": "acc_visa",
+      "amount": 6.45,
+      "date": "2026-07-07",
+      "name": "SQ *STARBUCKS",
+      "merchant_name": "Starbucks",
+      "pending": false,
+      "iso_currency_code": "USD",
+      "personal_finance_category": {"primary": "FOOD_AND_DRINK", "detailed": "FOOD_AND_DRINK_COFFEE"}
+    },
+    {
+      "transaction_id": "tx_fee",
+      "account_id": "acc_visa",
+      "amount": 10.0,
+      "date": "2026-07-18",
+      "name": "FOREIGN TRANSACTION FEE",
+      "merchant_name": null,
+      "pending": false,
+      "iso_currency_code": "USD",
+      "personal_finance_category": {"primary": "BANK_FEES", "detailed": "BANK_FEES_FOREIGN_TRANSACTION_FEES"}
+    }
+  ]
+}

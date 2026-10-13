@@ -1,0 +1,52 @@
+{
+  "accounts": [
+    {
+      "account_id": "acc_chk",
+      "name": "Everyday Checking",
+      "official_name": "Chase Total Checking",
+      "type": "depository",
+      "subtype": "checking",
+      "mask": "4412"
+    }
+  ],
+  "added": [
+    {
+      "transaction_id": "tx_rent",
+      "account_id": "acc_chk",
+      "amount": 1850.0,
+      "date": "2026-07-01",
+      "name": "AUSTIN TRAILS APTS",
+      "merchant_name": "Austin Trails Apartments",
+      "pending": false,
+      "payment_channel": "other",
+      "iso_currency_code": "USD",
+      "personal_finance_category": {"primary": "RENT_AND_UTILITIES", "detailed": "RENT_AND_UTILITIES_RENT"}
+    },
+    {
+      "transaction_id": "tx_payroll",
+      "account_id": "acc_chk",
+      "amount": -4200.0,
+      "date": "2026-07-15",
+      "name": "ACME CORP PAYROLL",
+      "merchant_name": "Acme Corp",
+      "pending": false,
+      "payment_channel": "other",
+      "iso_currency_code": "USD",
+      "personal_finance_category": {"primary": "INCOME", "detailed": "INCOME_WAGES"}
+    },
+    {
+      "transaction_id": "tx_visa_pay",
+      "account_id": "acc_chk",
+      "amount": 612.44,
+      "date": "2026-07-20",
+      "name": "CHASE CREDIT CRD AUTOPAY",
+      "merchant_name": null,
+      "pending": false,
+      "payment_channel": "other",
+      "iso_currency_code": "USD",
+      "personal_finance_category": {"primary": "TRANSFER_OUT", "detailed": "TRANSFER_OUT_ACCOUNT_TRANSFER"}
+    }
+  ],
+  "modified": [],
+  "removed": []
+}

@@ -1,0 +1,16 @@
+{
+  "date": "2026-07-25",
+  "id": "tok_boa",
+  "label": "BOA",
+  "investmentTransactions": [],
+  "snapshot": {
+    "accounts": [
+      {"account_id": "acc_boa", "name": "Adv Plus Banking", "official_name": "Bank of America Advantage Plus Banking", "type": "depository", "subtype": "checking", "mask": "3996", "balances": {"available": 5210.44, "current": 5210.44, "iso_currency_code": "USD"}}
+    ],
+    "fetchedAt": "2026-07-25T09:00:00Z",
+    "issues": []
+  },
+  "transactions": [
+    {"transaction_id": "tx_gas", "account_id": "acc_boa", "amount": 41.10, "date": "2026-07-25", "name": "SHELL OIL 4471", "merchant_name": "Shell", "pending": false, "iso_currency_code": "USD", "personal_finance_category": {"primary": "TRANSPORTATION", "detailed": "TRANSPORTATION_GAS"}}
+  ]
+}
