@@ -8,6 +8,36 @@
 //
 
 import Foundation
+import os
+
+/// Normalizes and describes Plaid credential text without exposing secrets.
+enum PlaidCredentialText {
+    /// Drops whitespace, control characters, and invisible characters anywhere
+    /// in the string, not only at the ends. A wrapped paste can hide a newline
+    /// in the middle of a secret; trimming the ends leaves that in the JSON body.
+    static func normalized(_ value: String) -> String {
+        let filtered = value.unicodeScalars.filter { scalar in
+            !CharacterSet.whitespacesAndNewlines.contains(scalar)
+                && !CharacterSet.controlCharacters.contains(scalar)
+                && !scalar.properties.isDefaultIgnorableCodePoint
+        }
+        return String(String.UnicodeScalarView(filtered))
+    }
+
+    /// First four characters and the length. Never the full client_id.
+    static func clientIdLabel(_ clientId: String) -> String {
+        guard !clientId.isEmpty else { return "empty" }
+        return "\(clientId.prefix(4))… len \(clientId.count)"
+    }
+
+    /// The fixed environment tag of a Plaid access token, not its unique id.
+    static func accessTokenKind(_ token: String) -> String {
+        for kind in ["access-sandbox", "access-production", "access-development"] {
+            if token.hasPrefix(kind + "-") { return kind }
+        }
+        return "unrecognized"
+    }
+}
 
 // MARK: - Credentials & Environment
 
@@ -15,6 +45,19 @@ struct PlaidCredentials {
     let clientId: String
     let secret: String
     let accessToken: String
+    /// Keychain slot the client_id and secret were read from: sandbox, production, or legacy.
+    let source: String
+
+    /// Safe to log and show in the UI. Includes no secret and no access-token id.
+    func debugSummary(environment: PlaidEnvironment, url: URL, sendsAccessToken: Bool) -> String {
+        let token: String
+        if sendsAccessToken {
+            token = "len \(accessToken.count), kind \(PlaidCredentialText.accessTokenKind(accessToken))"
+        } else {
+            token = "not sent"
+        }
+        return "slot \(source), client_id \(PlaidCredentialText.clientIdLabel(clientId)), secret len \(secret.count), access token \(token), \(url.absoluteString)"
+    }
 }
 
 /// Metadata for one stored access token. The token itself lives in the
@@ -81,6 +124,8 @@ struct PlaidAPIError: Codable, Error, LocalizedError {
 
     /// Host the failing request was sent to. Not part of Plaid's JSON envelope.
     var environment: PlaidEnvironment? = nil
+    /// Lengths and a client_id prefix. Never a secret. Not part of Plaid's JSON.
+    var debugSummary: String? = nil
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -90,6 +135,7 @@ struct PlaidAPIError: Codable, Error, LocalizedError {
         displayMessage = try container.decodeIfPresent(String.self, forKey: .displayMessage)
         requestId = try container.decodeIfPresent(String.self, forKey: .requestId)
         environment = nil
+        debugSummary = nil
     }
 
     func encode(to encoder: Encoder) throws {
@@ -102,9 +148,19 @@ struct PlaidAPIError: Codable, Error, LocalizedError {
     }
 
     var errorDescription: String? {
-        let detail = displayMessage ?? errorMessage ?? errorCode ?? "Unknown Plaid error"
-        guard let environment else { return detail }
-        return "\(environment.displayName): \(detail)"
+        let code = errorCode ?? "UNKNOWN"
+        let message = errorMessage ?? displayMessage ?? "Unknown Plaid error"
+        var text = "\(code) — \(message)"
+        if let displayMessage, !displayMessage.isEmpty, displayMessage != message {
+            text += " — \(displayMessage)"
+        }
+        if let environment {
+            text = "\(environment.displayName): \(text)"
+        }
+        if let debugSummary {
+            text += ". \(debugSummary)"
+        }
+        return text
     }
 
     /// True when the error means this product simply isn't available for the
@@ -465,6 +521,7 @@ struct PlaidClient {
     let environment: PlaidEnvironment
     private let session: URLSession
     private let decoder: JSONDecoder
+    private let log = Logger(subsystem: "com.mlaid.FinAgentMenuBar", category: "Plaid")
 
     init(credentials: PlaidCredentials,
          environment: PlaidEnvironment,
@@ -546,6 +603,18 @@ struct PlaidClient {
         try await post("/liabilities/get", body: [:])
     }
 
+    /// Confirms client_id and secret with Plaid before any access token is sent.
+    /// `/institutions/get` checks the key pair and does not take an access token,
+    /// so a failure here is INVALID_API_KEYS rather than a bad token.
+    func verifyClientCredentials() async throws {
+        let body: [String: Any] = [
+            "count": 1,
+            "offset": 0,
+            "country_codes": ["US"]
+        ]
+        let _: EmptyJSONObject = try await post("/institutions/get", body: body, sendsAccessToken: false)
+    }
+
     /// Rotate this Item's access token. Invalidates the current token
     /// immediately and returns a new one for the same Item.
     func rotateAccessToken() async throws -> String {
@@ -556,13 +625,33 @@ struct PlaidClient {
     // MARK: Request plumbing
 
     /// POST `body` (with credentials injected) to `path` and decode the reply.
-    private func post<T: Decodable>(_ path: String, body: [String: Any]) async throws -> T {
-        var payload = body
-        payload["client_id"] = credentials.clientId
-        payload["secret"] = credentials.secret
-        payload["access_token"] = credentials.accessToken
+    /// Credentials go in the JSON body (`client_id`, `secret`), which is what
+    /// `https://sandbox.plaid.com/institutions/get` accepts. Headers are not used.
+    private func post<T: Decodable>(_ path: String, body: [String: Any], sendsAccessToken: Bool = true) async throws -> T {
+        guard let url = endpointURL(path) else {
+            throw PlaidClientError.invalidResponse(environment: environment)
+        }
+        let clientId = PlaidCredentialText.normalized(credentials.clientId)
+        let secret = PlaidCredentialText.normalized(credentials.secret)
+        let summary = PlaidCredentials(
+            clientId: clientId,
+            secret: secret,
+            accessToken: credentials.accessToken,
+            source: credentials.source
+        ).debugSummary(environment: environment, url: url, sendsAccessToken: sendsAccessToken)
+        // Safe fields only: client_id prefix and lengths. Never the secret or token id.
+        let line = "Plaid \(environment.rawValue) POST \(summary)"
+        print(line)
+        log.info("\(line, privacy: .public)")
 
-        var request = URLRequest(url: environment.baseURL.appendingPathComponent(path))
+        var payload = body
+        payload["client_id"] = clientId
+        payload["secret"] = secret
+        if sendsAccessToken {
+            payload["access_token"] = PlaidCredentialText.normalized(credentials.accessToken)
+        }
+
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
@@ -577,6 +666,10 @@ struct PlaidClient {
             // Plaid returns a structured error envelope on failure.
             if var apiError = try? decoder.decode(PlaidAPIError.self, from: data) {
                 apiError.environment = environment
+                apiError.debugSummary = summary
+                let failure = "Plaid error \(apiError.errorCode ?? "?") \(apiError.errorMessage ?? "") \(summary)"
+                print(failure)
+                log.error("\(failure, privacy: .public)")
                 throw apiError
             }
             let bodyText = String(data: data, encoding: .utf8) ?? "<no body>"
@@ -585,4 +678,23 @@ struct PlaidClient {
 
         return try decoder.decode(T.self, from: data)
     }
+
+    /// Path join that keeps `/transactions/sync` as a real path. `appendingPathComponent`
+    /// percent-encodes `?` and can treat a leading slash as one component.
+    private func endpointURL(_ path: String) -> URL? {
+        let relative = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        guard var components = URLComponents(url: environment.baseURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        let basePath = components.path
+        if basePath.isEmpty || basePath == "/" {
+            components.path = "/" + relative
+        } else {
+            components.path = (basePath.hasSuffix("/") ? basePath : basePath + "/") + relative
+        }
+        return components.url
+    }
 }
+
+/// Decodes a JSON object while ignoring its keys. Used for the credential probe.
+private struct EmptyJSONObject: Decodable {}

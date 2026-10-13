@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import AppKit
 
 struct ContentView: View {
     @StateObject private var manager = FinAgentDataManager.shared
@@ -22,6 +23,7 @@ struct ContentView: View {
     @State private var updateClientIdInput = ""
     @State private var updateSecretInput = ""
     @State private var updateEnvironment: PlaidEnvironment = .production
+    @State private var didSeedUpdateForm = false
 
     // Cloud Storage service-account key. Held only in this view until Save,
     // then wiped. The persisted copy is in the Keychain.
@@ -163,14 +165,20 @@ struct ContentView: View {
                 .textFieldStyle(.roundedBorder)
 
             Button("Save Credentials Securely") {
-                Task {
-                    await apiManager.storeSharedCredentials(
-                        clientId: clientIdInput,
-                        secret: secretInput,
-                        environment: setupEnvironment
-                    )
-                    clientIdInput = ""
-                    secretInput = ""
+                commitTextInputs()
+                DispatchQueue.main.async {
+                    let clientId = clientIdInput
+                    let secret = secretInput
+                    let environment = setupEnvironment
+                    Task {
+                        await apiManager.storeSharedCredentials(
+                            clientId: clientId,
+                            secret: secret,
+                            environment: environment
+                        )
+                        clientIdInput = ""
+                        secretInput = ""
+                    }
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -290,7 +298,7 @@ struct ContentView: View {
 
     private var updateCredentialsControls: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Sandbox and Production each keep their own client_id and secret. A blank field keeps the value already saved for the environment selected here. Tokens are preserved.")
+            Text("Sandbox and Production each keep their own client_id and secret. Paste both from the Plaid Dashboard for the environment selected here. A blank field keeps only a value already saved for that same environment. Changing the environment clears the secret. Tokens are preserved.")
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -303,21 +311,43 @@ struct ContentView: View {
                     .foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if !apiManager.hasStoredClientId(for: updateEnvironment), let legacy = apiManager.legacyClientIdLabel() {
+                Text("An older unlabeled client_id is still on this Mac (\(legacy)). It is not sent. Paste the \(updateEnvironment.displayName) client_id if that is the one you want.")
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             TextField("client_id", text: $updateClientIdInput)
                 .textFieldStyle(.roundedBorder)
+            if !updateClientIdInput.isEmpty {
+                Text("client_id to save: \(PlaidCredentialText.clientIdLabel(PlaidCredentialText.normalized(updateClientIdInput)))")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
             SecureField("new secret (blank = keep)", text: $updateSecretInput)
                 .textFieldStyle(.roundedBorder)
+            if !updateSecretInput.isEmpty {
+                Text("secret to save: len \(PlaidCredentialText.normalized(updateSecretInput).count)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
 
             Button("Update Credentials") {
-                Task {
-                    await apiManager.updateSharedCredentials(
-                        clientId: updateClientIdInput,
-                        secret: updateSecretInput,
-                        environment: updateEnvironment
-                    )
-                    updateSecretInput = ""
-                    updateClientIdInput = apiManager.currentClientId(for: updateEnvironment) ?? updateClientIdInput
+                commitTextInputs()
+                DispatchQueue.main.async {
+                    let clientId = updateClientIdInput
+                    let secret = updateSecretInput
+                    let environment = updateEnvironment
+                    Task {
+                        await apiManager.updateSharedCredentials(
+                            clientId: clientId,
+                            secret: secret,
+                            environment: environment
+                        )
+                        updateSecretInput = ""
+                        updateClientIdInput = apiManager.currentClientId(for: environment) ?? clientId
+                    }
                 }
             }
             .disabled(!canUpdateCredentials)
@@ -336,14 +366,23 @@ struct ContentView: View {
         }
         .padding(.top, 4)
         .onAppear {
+            guard !didSeedUpdateForm else { return }
             updateEnvironment = apiManager.plaidEnvironment
-            if updateClientIdInput.isEmpty {
-                updateClientIdInput = apiManager.currentClientId(for: updateEnvironment) ?? ""
-            }
+            updateClientIdInput = apiManager.currentClientId(for: apiManager.plaidEnvironment) ?? ""
+            didSeedUpdateForm = true
         }
         .onChange(of: updateEnvironment) { _, newEnvironment in
+            guard didSeedUpdateForm else { return }
             updateClientIdInput = apiManager.currentClientId(for: newEnvironment) ?? ""
             updateSecretInput = ""
+        }
+    }
+
+    /// Menu-bar text fields keep the typed value until they resign first responder.
+    /// A click on Update would otherwise save the previous client_id or an empty secret.
+    private func commitTextInputs() {
+        for window in NSApp.windows {
+            window.makeFirstResponder(nil)
         }
     }
 
