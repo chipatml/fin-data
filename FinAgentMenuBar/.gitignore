@@ -12,3 +12,39 @@ xcuserdata/
 *.ipa
 *.dSYM.zip
 *.dSYM
+
+# More Xcode user state. xcuserdata/ above already covers project and workspace userdata.
+*.xcuserdatad
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+
+# Swift Package Manager local state
+.build/
+.swiftpm/
+
+# Secrets and local config. Entitlements stay tracked.
+.env
+.env.*
+!.env.example
+*.xcconfig
+!*.example.xcconfig
+GoogleService-Info.plist
+Secrets.plist
+client_secret*.json
+credentials.json
+
+# Signing material and Keychain exports
+*.p12
+*.pem
+*.cer
+*.mobileprovision
+*.provisionprofile
+*.keychain
+*.keychain-db
+
+# Local financial dumps copied into this app tree.
+# This file is FinAgentMenuBar/.gitignore, so Data/ cannot match outside it.
+Data/
