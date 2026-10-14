@@ -724,9 +724,12 @@ class FinAgentDataManager: ObservableObject {
         let host = environment
         var savedNames: [String] = []
         defer {
-            guard linkGeneration == generation else { return }
-            isLinking = false
-            linkTask = nil
+            // `return` cannot leave a defer. A newer link generation must keep
+            // its own in-progress state when this attempt finishes.
+            if linkGeneration == generation {
+                isLinking = false
+                linkTask = nil
+            }
         }
         do {
             let credentials = try apiManager.linkCredentials(for: host)
