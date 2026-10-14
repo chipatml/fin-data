@@ -117,9 +117,12 @@ class APIKeyManager: ObservableObject {
         // A blank field keeps the value already stored for this environment.
         // The unlabeled client_id/secret are not copied in: that pair was not
         // tagged with an environment, and sending it with a new secret is what
-        // Plaid reports as INVALID_API_KEYS.
-        let resolvedClientId = trimmedClientId.isEmpty ? currentClientId(for: environment) : trimmedClientId
-        guard let resolvedClientId else {
+        // Plaid reports as INVALID_API_KEYS. Re-normalize a kept value so a
+        // smart dash stored earlier is replaced with the ASCII Plaid issued.
+        let resolvedClientId = trimmedClientId.isEmpty
+            ? currentClientId(for: environment).map(Self.trimmedCredential)
+            : trimmedClientId
+        guard let resolvedClientId, !resolvedClientId.isEmpty else {
             errorMessage = "Enter the \(environment.displayName) client_id. An older unlabeled client_id is not copied in."
             statusMessage = "Update failed"
             return
@@ -137,7 +140,11 @@ class APIKeyManager: ObservableObject {
                 try encryptAndStore(trimmedSecret, using: symmetricKey, account: secretAccount(for: environment))
                 expectedSecret = trimmedSecret
             } else if let kept = try trimmedStored(account: secretAccount(for: environment), using: symmetricKey) {
-                expectedSecret = kept
+                let healed = Self.trimmedCredential(kept)
+                if healed != kept {
+                    try encryptAndStore(healed, using: symmetricKey, account: secretAccount(for: environment))
+                }
+                expectedSecret = healed
             } else {
                 throw KeychainError.readBackMismatch(environment: environment)
             }
@@ -163,7 +170,26 @@ class APIKeyManager: ObservableObject {
     func legacyClientIdLabel() -> String? {
         guard let symmetricKey = try? currentSymmetricKey() else { return nil }
         guard let value = storedCredential(account: legacyClientIdAccount, using: symmetricKey) else { return nil }
-        return PlaidCredentialText.clientIdLabel(value)
+        return PlaidCredentialText.clientIdLabel(PlaidCredentialText.normalized(value))
+    }
+
+    /// Hash and code points of the pair a pull would send. No secret text.
+    func storedCredentialFingerprint(for environment: PlaidEnvironment) -> String? {
+        guard let symmetricKey = try? currentSymmetricKey() else { return nil }
+        guard let clientId = storedCredential(account: clientIdAccount(for: environment), using: symmetricKey),
+              let secret = storedCredential(account: secretAccount(for: environment), using: symmetricKey) else {
+            return nil
+        }
+        let sentId = Self.trimmedCredential(clientId)
+        let sentSecret = Self.trimmedCredential(secret)
+        var line = "Saved \(PlaidCredentialText.fingerprintLine(sentId, label: "client_id", revealPrefix: true)); \(PlaidCredentialText.fingerprintLine(sentSecret, label: "secret", revealPrefix: false))"
+        if clientId != sentId {
+            line += ". Before normalize, client_id \(PlaidCredentialText.anomalySummary(clientId))"
+        }
+        if secret != sentSecret {
+            line += ". Before normalize, secret \(PlaidCredentialText.anomalySummary(secret))"
+        }
+        return line
     }
 
     /// True when this environment has its own secret in the keychain.
@@ -190,12 +216,22 @@ class APIKeyManager: ObservableObject {
     }
 
     // MARK: - Access Tokens (multiple, each labeled)
+    /// Institution names can repeat. The stored label stays unique without adding account numbers.
+    func uniqueTokenLabel(_ base: String) -> String {
+        let existing = Set(tokenEntries.map(\.label))
+        if !existing.contains(base) { return base }
+        var suffix = 2
+        while existing.contains("\(base) \(suffix)") { suffix += 1 }
+        return "\(base) \(suffix)"
+    }
+
     /// Adds a labeled access token, returning its generated id.
+    /// `environment` tags the token so later pulls use that host and its client_id/secret.
     @discardableResult
-    func addAccessToken(label: String, token: String) async -> String? {
+    func addAccessToken(label: String, token: String, environment: PlaidEnvironment? = nil) async -> String? {
         do {
             let symmetricKey = try currentSymmetricKey()
-            let entry = PlaidTokenEntry(label: label)
+            let entry = PlaidTokenEntry(label: label, environment: environment)
             let trimmedToken = Self.trimmedCredential(token)
             guard !trimmedToken.isEmpty else {
                 errorMessage = "Enter an access token."
@@ -509,11 +545,44 @@ class APIKeyManager: ObservableObject {
         return key
     }
 
-    /// Decrypts the credentials for the selected environment plus the token for `id`.
+    /// Host for this token. Untagged tokens still use the environment selected in the menu.
+    func environment(forTokenId id: String) -> PlaidEnvironment {
+        tokenEntries.first { $0.id == id }?.plaidEnvironment ?? plaidEnvironment
+    }
+
+    /// Stable Plaid `user.client_user_id` for this Mac. Not a secret and not PII.
+    func plaidClientUserId() -> String {
+        let key = "com.mlaid.finagent.plaid.client_user_id"
+        if let existing = UserDefaults.standard.string(forKey: key),
+           existing.count >= 8,
+           existing.count <= 128,
+           existing.unicodeScalars.allSatisfy({ scalar in
+               scalar.value < 128 && !CharacterSet.whitespacesAndNewlines.contains(scalar)
+           }) {
+            return existing
+        }
+        let created = UUID().uuidString
+        UserDefaults.standard.set(created, forKey: key)
+        return created
+    }
+
+    /// client_id and secret for `environment`, with no access token. Used by Hosted Link.
+    func linkCredentials(for environment: PlaidEnvironment) throws -> PlaidCredentials {
+        let symmetricKey = try currentSymmetricKey()
+        let pair = try credentialPair(for: environment, using: symmetricKey)
+        return PlaidCredentials(
+            clientId: pair.clientId,
+            secret: pair.secret,
+            accessToken: "",
+            source: pair.source
+        )
+    }
+
+    /// Decrypts the credentials for the token's environment plus the token for `id`.
     /// Read on every request, so an update applies without restarting the app.
     func credentials(forTokenId id: String) throws -> PlaidCredentials {
         let symmetricKey = try currentSymmetricKey()
-        let pair = try credentialPair(for: plaidEnvironment, using: symmetricKey)
+        let pair = try credentialPair(for: environment(forTokenId: id), using: symmetricKey)
         let accessToken = Self.trimmedCredential(
             try decrypt(account: accessTokenAccount(for: id), using: symmetricKey)
         )
@@ -555,14 +624,17 @@ class APIKeyManager: ObservableObject {
     }
 
     private static func savedCredentialLabel(clientId: String, secret: String) -> String {
-        "client_id \(PlaidCredentialText.clientIdLabel(clientId)), secret len \(secret.count)"
+        "\(PlaidCredentialText.fingerprintLine(clientId, label: "client_id", revealPrefix: true)); \(PlaidCredentialText.fingerprintLine(secret, label: "secret", revealPrefix: false))"
     }
 
     /// Nil when the account is absent or the stored value is only whitespace.
+    /// Returns the stored bytes, not the normalized form, so a pull can report
+    /// smart punctuation that is folded only at send time.
     private func trimmedStored(account: String, using symmetricKey: SymmetricKey) throws -> String? {
         do {
-            let trimmed = Self.trimmedCredential(try decrypt(account: account, using: symmetricKey))
-            return trimmed.isEmpty ? nil : trimmed
+            let raw = try decrypt(account: account, using: symmetricKey)
+            guard !Self.trimmedCredential(raw).isEmpty else { return nil }
+            return raw
         } catch KeychainError.keyNotFound {
             return nil
         }
