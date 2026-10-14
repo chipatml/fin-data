@@ -117,9 +117,12 @@ class APIKeyManager: ObservableObject {
         // A blank field keeps the value already stored for this environment.
         // The unlabeled client_id/secret are not copied in: that pair was not
         // tagged with an environment, and sending it with a new secret is what
-        // Plaid reports as INVALID_API_KEYS.
-        let resolvedClientId = trimmedClientId.isEmpty ? currentClientId(for: environment) : trimmedClientId
-        guard let resolvedClientId else {
+        // Plaid reports as INVALID_API_KEYS. Re-normalize a kept value so a
+        // smart dash stored earlier is replaced with the ASCII Plaid issued.
+        let resolvedClientId = trimmedClientId.isEmpty
+            ? currentClientId(for: environment).map(Self.trimmedCredential)
+            : trimmedClientId
+        guard let resolvedClientId, !resolvedClientId.isEmpty else {
             errorMessage = "Enter the \(environment.displayName) client_id. An older unlabeled client_id is not copied in."
             statusMessage = "Update failed"
             return
@@ -137,7 +140,11 @@ class APIKeyManager: ObservableObject {
                 try encryptAndStore(trimmedSecret, using: symmetricKey, account: secretAccount(for: environment))
                 expectedSecret = trimmedSecret
             } else if let kept = try trimmedStored(account: secretAccount(for: environment), using: symmetricKey) {
-                expectedSecret = kept
+                let healed = Self.trimmedCredential(kept)
+                if healed != kept {
+                    try encryptAndStore(healed, using: symmetricKey, account: secretAccount(for: environment))
+                }
+                expectedSecret = healed
             } else {
                 throw KeychainError.readBackMismatch(environment: environment)
             }
@@ -163,7 +170,26 @@ class APIKeyManager: ObservableObject {
     func legacyClientIdLabel() -> String? {
         guard let symmetricKey = try? currentSymmetricKey() else { return nil }
         guard let value = storedCredential(account: legacyClientIdAccount, using: symmetricKey) else { return nil }
-        return PlaidCredentialText.clientIdLabel(value)
+        return PlaidCredentialText.clientIdLabel(PlaidCredentialText.normalized(value))
+    }
+
+    /// Hash and code points of the pair a pull would send. No secret text.
+    func storedCredentialFingerprint(for environment: PlaidEnvironment) -> String? {
+        guard let symmetricKey = try? currentSymmetricKey() else { return nil }
+        guard let clientId = storedCredential(account: clientIdAccount(for: environment), using: symmetricKey),
+              let secret = storedCredential(account: secretAccount(for: environment), using: symmetricKey) else {
+            return nil
+        }
+        let sentId = Self.trimmedCredential(clientId)
+        let sentSecret = Self.trimmedCredential(secret)
+        var line = "Saved \(PlaidCredentialText.fingerprintLine(sentId, label: "client_id", revealPrefix: true)); \(PlaidCredentialText.fingerprintLine(sentSecret, label: "secret", revealPrefix: false))"
+        if clientId != sentId {
+            line += ". Before normalize, client_id \(PlaidCredentialText.anomalySummary(clientId))"
+        }
+        if secret != sentSecret {
+            line += ". Before normalize, secret \(PlaidCredentialText.anomalySummary(secret))"
+        }
+        return line
     }
 
     /// True when this environment has its own secret in the keychain.
@@ -555,14 +581,17 @@ class APIKeyManager: ObservableObject {
     }
 
     private static func savedCredentialLabel(clientId: String, secret: String) -> String {
-        "client_id \(PlaidCredentialText.clientIdLabel(clientId)), secret len \(secret.count)"
+        "\(PlaidCredentialText.fingerprintLine(clientId, label: "client_id", revealPrefix: true)); \(PlaidCredentialText.fingerprintLine(secret, label: "secret", revealPrefix: false))"
     }
 
     /// Nil when the account is absent or the stored value is only whitespace.
+    /// Returns the stored bytes, not the normalized form, so a pull can report
+    /// smart punctuation that is folded only at send time.
     private func trimmedStored(account: String, using symmetricKey: SymmetricKey) throws -> String? {
         do {
-            let trimmed = Self.trimmedCredential(try decrypt(account: account, using: symmetricKey))
-            return trimmed.isEmpty ? nil : trimmed
+            let raw = try decrypt(account: account, using: symmetricKey)
+            guard !Self.trimmedCredential(raw).isEmpty else { return nil }
+            return raw
         } catch KeychainError.keyNotFound {
             return nil
         }

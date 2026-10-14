@@ -24,6 +24,8 @@ struct ContentView: View {
     @State private var updateSecretInput = ""
     @State private var updateEnvironment: PlaidEnvironment = .production
     @State private var didSeedUpdateForm = false
+    @StateObject private var credentialFields = PlainCredentialFieldRegistry()
+    @State private var curlCopyNote = ""
 
     // Cloud Storage service-account key. Held only in this view until Save,
     // then wiped. The persisted copy is in the Keychain.
@@ -159,26 +161,42 @@ struct ContentView: View {
 
             environmentPicker(selection: $setupEnvironment)
 
-            SecureField("client_id", text: $clientIdInput)
-                .textFieldStyle(.roundedBorder)
-            SecureField("secret", text: $secretInput)
-                .textFieldStyle(.roundedBorder)
+            PlainCredentialField(
+                key: "setup.clientId",
+                placeholder: "client_id",
+                isSecure: true,
+                text: $clientIdInput,
+                registry: credentialFields
+            )
+            credentialFingerprint(label: "client_id", raw: clientIdInput, revealPrefix: true)
+            PlainCredentialField(
+                key: "setup.secret",
+                placeholder: "secret",
+                isSecure: true,
+                text: $secretInput,
+                registry: credentialFields
+            )
+            credentialFingerprint(label: "secret", raw: secretInput, revealPrefix: false)
 
             Button("Save Credentials Securely") {
-                commitTextInputs()
-                DispatchQueue.main.async {
-                    let clientId = clientIdInput
-                    let secret = secretInput
-                    let environment = setupEnvironment
-                    Task {
-                        await apiManager.storeSharedCredentials(
-                            clientId: clientId,
-                            secret: secret,
-                            environment: environment
-                        )
-                        clientIdInput = ""
-                        secretInput = ""
-                    }
+                let clientId = liveCredential(key: "setup.clientId", fallback: clientIdInput)
+                let secret = liveCredential(key: "setup.secret", fallback: secretInput)
+                let environment = setupEnvironment
+                guard !PlainCredentialFieldReader.isBulletMask(clientId),
+                      !PlainCredentialFieldReader.isBulletMask(secret) else {
+                    apiManager.errorMessage = "\(environment.displayName): the credential field returned the password mask instead of the pasted value. Click the field and paste again."
+                    return
+                }
+                clientIdInput = clientId
+                secretInput = secret
+                Task {
+                    await apiManager.storeSharedCredentials(
+                        clientId: clientId,
+                        secret: secret,
+                        environment: environment
+                    )
+                    clientIdInput = ""
+                    secretInput = ""
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -235,6 +253,9 @@ struct ContentView: View {
                 Text(error)
                     .font(.caption)
                     .foregroundColor(.red)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                copyCurlButton(environment: apiManager.plaidEnvironment)
             }
 
             Button(manager.isRefreshing ? "Pulling…" : "Pull Plaid Data Now") {
@@ -298,12 +319,20 @@ struct ContentView: View {
 
     private var updateCredentialsControls: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Sandbox and Production each keep their own client_id and secret. Paste both from the Plaid Dashboard for the environment selected here. A blank field keeps only a value already saved for that same environment. Changing the environment clears the secret. Tokens are preserved.")
+            Text("Sandbox and Production each keep their own client_id and secret. Paste both from the Plaid Dashboard for the environment selected here. A blank field keeps only a value already saved for that same environment. Changing the environment clears the secret. Tokens are preserved. These fields do not apply smart quotes, dashes, or autocorrect. A lookalike character is folded to ASCII before it is saved.")
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             environmentPicker(selection: $updateEnvironment)
+
+            if let saved = apiManager.storedCredentialFingerprint(for: updateEnvironment) {
+                Text(saved)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if !apiManager.hasStoredSecret(for: updateEnvironment) {
                 Text(updateSecretHint)
@@ -318,36 +347,48 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            TextField("client_id", text: $updateClientIdInput)
-                .textFieldStyle(.roundedBorder)
-            if !updateClientIdInput.isEmpty {
-                Text("client_id to save: \(PlaidCredentialText.clientIdLabel(PlaidCredentialText.normalized(updateClientIdInput)))")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-            SecureField("new secret (blank = keep)", text: $updateSecretInput)
-                .textFieldStyle(.roundedBorder)
-            if !updateSecretInput.isEmpty {
-                Text("secret to save: len \(PlaidCredentialText.normalized(updateSecretInput).count)")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
+            PlainCredentialField(
+                key: "update.clientId",
+                placeholder: "client_id",
+                isSecure: false,
+                text: $updateClientIdInput,
+                registry: credentialFields
+            )
+            credentialFingerprint(label: "client_id", raw: updateClientIdInput, revealPrefix: true)
+            PlainCredentialField(
+                key: "update.secret",
+                placeholder: "new secret (blank = keep)",
+                isSecure: true,
+                text: $updateSecretInput,
+                registry: credentialFields
+            )
+            credentialFingerprint(label: "secret", raw: updateSecretInput, revealPrefix: false)
+            Text("Compare sha256 with printf %s 'SECRET' | shasum -a 256 (first 8 hex). Do not use echo; it adds a newline.")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            copyCurlButton(environment: updateEnvironment)
 
             Button("Update Credentials") {
-                commitTextInputs()
-                DispatchQueue.main.async {
-                    let clientId = updateClientIdInput
-                    let secret = updateSecretInput
-                    let environment = updateEnvironment
-                    Task {
-                        await apiManager.updateSharedCredentials(
-                            clientId: clientId,
-                            secret: secret,
-                            environment: environment
-                        )
-                        updateSecretInput = ""
-                        updateClientIdInput = apiManager.currentClientId(for: environment) ?? clientId
-                    }
+                let clientId = liveCredential(key: "update.clientId", fallback: updateClientIdInput)
+                let secret = liveCredential(key: "update.secret", fallback: updateSecretInput)
+                let environment = updateEnvironment
+                guard !PlainCredentialFieldReader.isBulletMask(clientId),
+                      !PlainCredentialFieldReader.isBulletMask(secret) else {
+                    apiManager.errorMessage = "\(environment.displayName): the credential field returned the password mask instead of the pasted value. Click the field and paste again."
+                    return
+                }
+                updateClientIdInput = clientId
+                updateSecretInput = secret
+                Task {
+                    await apiManager.updateSharedCredentials(
+                        clientId: clientId,
+                        secret: secret,
+                        environment: environment
+                    )
+                    updateSecretInput = ""
+                    updateClientIdInput = apiManager.currentClientId(for: environment) ?? clientId
                 }
             }
             .disabled(!canUpdateCredentials)
@@ -361,6 +402,7 @@ struct ContentView: View {
                 Text(apiManager.statusMessage)
                     .font(.caption2)
                     .foregroundColor(.secondary)
+                    .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -378,11 +420,48 @@ struct ContentView: View {
         }
     }
 
-    /// Menu-bar text fields keep the typed value until they resign first responder.
-    /// A click on Update would otherwise save the previous client_id or an empty secret.
-    private func commitTextInputs() {
-        for window in NSApp.windows {
-            window.makeFirstResponder(nil)
+    /// The AppKit field is the source of truth. The binding can still be empty
+    /// when a menu-bar secure field has not published the paste yet.
+    private func liveCredential(key: String, fallback: String) -> String {
+        let live = credentialFields.value(for: key) ?? fallback
+        if PlainCredentialFieldReader.isBulletMask(live), !PlainCredentialFieldReader.isBulletMask(fallback) {
+            return fallback
+        }
+        return live
+    }
+
+    @ViewBuilder
+    private func credentialFingerprint(label: String, raw: String, revealPrefix: Bool) -> some View {
+        let sent = PlaidCredentialText.normalized(raw)
+        if !raw.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(PlaidCredentialText.fingerprintLine(sent, label: label, revealPrefix: revealPrefix))
+                if raw != sent {
+                    Text("Before normalize, \(label) \(PlaidCredentialText.anomalySummary(raw))")
+                }
+            }
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+        }
+    }
+
+    private func copyCurlButton(environment: PlaidEnvironment) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Button("Copy curl test command") {
+                let command = PlaidProbeCurl.placeholderCommand(for: environment)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(command, forType: .string)
+                curlCopyNote = "Copied a \(environment.displayName) curl command with CLIENT_ID and SECRET placeholders. Compare sha256 with printf %s 'SECRET' | shasum -a 256 (first 8 hex, not echo)."
+            }
+            if !curlCopyNote.isEmpty {
+                Text(curlCopyNote)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
         }
     }
 

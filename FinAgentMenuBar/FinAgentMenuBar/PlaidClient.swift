@@ -7,27 +7,132 @@
 //  and sent in the JSON body of every request, as Plaid expects.
 //
 
+import CryptoKit
 import Foundation
 import os
 
 /// Normalizes and describes Plaid credential text without exposing secrets.
 enum PlaidCredentialText {
-    /// Drops whitespace, control characters, and invisible characters anywhere
-    /// in the string, not only at the ends. A wrapped paste can hide a newline
-    /// in the middle of a secret; trimming the ends leaves that in the JSON body.
+    private static var loggedNormalizations: Set<String> = []
+
+    /// Folds smart punctuation to ASCII, then drops whitespace, control
+    /// characters, and invisible characters anywhere in the string. macOS text
+    /// fields turn a hyphen or quote into a lookalike (en dash, curly quote)
+    /// that keeps the same character count and changes the UTF-8 Plaid checks.
     static func normalized(_ value: String) -> String {
-        let filtered = value.unicodeScalars.filter { scalar in
+        let folded = foldSmartPunctuation(value)
+        let filtered = folded.unicodeScalars.filter { scalar in
             !CharacterSet.whitespacesAndNewlines.contains(scalar)
                 && !CharacterSet.controlCharacters.contains(scalar)
                 && !scalar.properties.isDefaultIgnorableCodePoint
         }
-        return String(String.UnicodeScalarView(filtered))
+        let result = String(String.UnicodeScalarView(filtered))
+        logNormalizationIfNeeded(raw: value, sent: result)
+        return result
+    }
+
+    /// First 8 hex digits of SHA-256 over the UTF-8 bytes. Compare with
+    /// `printf %s 'SECRET' | shasum -a 256` (not `echo`, which adds a newline).
+    static func sha256Prefix(_ value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return digest.prefix(4).reduce(into: "") { partial, byte in
+            partial += String(format: "%02x", byte)
+        }
+    }
+
+    /// Counts, hash, and code points. Never includes the credential text.
+    /// `revealPrefix` is only for a client_id, whose first four characters are
+    /// already shown in the UI.
+    static func fingerprintLine(_ value: String, label: String, revealPrefix: Bool) -> String {
+        let prefix: String
+        if revealPrefix, !value.isEmpty {
+            prefix = " \(value.prefix(4))…"
+        } else {
+            prefix = ""
+        }
+        return "\(label)\(prefix) \(anomalySummary(value)) sha256:\(sha256Prefix(value))"
+    }
+
+    /// Character count, UTF-8 byte count, and non-ASCII / other-ASCII scalars
+    /// as `index:U+XXXX`. The character itself is not included.
+    static func anomalySummary(_ value: String) -> String {
+        let scalars = value.unicodeScalars.count
+        let chars = value.count
+        let charText = chars == scalars ? "chars \(chars)" : "chars \(chars) scalars \(scalars)"
+        return "\(charText) utf8 \(value.utf8.count) nonascii \(codePointList(value, where: { $0.value > 127 })) other-ascii \(codePointList(value, where: isOtherASCII))"
     }
 
     /// First four characters and the length. Never the full client_id.
     static func clientIdLabel(_ clientId: String) -> String {
         guard !clientId.isEmpty else { return "empty" }
         return "\(clientId.prefix(4))… len \(clientId.count)"
+    }
+
+    /// `index:U+XXXX` for scalars matching `include`, capped so a long secret
+    /// cannot flood the log. Empty means `none`.
+    static func codePointList(_ value: String, where include: (Unicode.Scalar) -> Bool) -> String {
+        var notes: [String] = []
+        var extra = 0
+        for (index, scalar) in value.unicodeScalars.enumerated() where include(scalar) {
+            if notes.count < 8 {
+                notes.append("\(index):U+\(String(format: "%04X", scalar.value))")
+            } else {
+                extra += 1
+            }
+        }
+        guard !notes.isEmpty else { return "none" }
+        if extra > 0 {
+            return notes.joined(separator: ",") + " +\(extra)"
+        }
+        return notes.joined(separator: ",")
+    }
+
+    private static func isOtherASCII(_ scalar: Unicode.Scalar) -> Bool {
+        let value = scalar.value
+        guard value < 128 else { return false }
+        let isDigit = value >= 0x30 && value <= 0x39
+        let isUpper = value >= 0x41 && value <= 0x5A
+        let isLower = value >= 0x61 && value <= 0x7A
+        return !(isDigit || isUpper || isLower)
+    }
+
+    /// Maps dash and quote lookalikes, and fullwidth ASCII, onto the characters
+    /// Plaid issued. ASCII hyphens and quotes are left alone.
+    private static func foldSmartPunctuation(_ value: String) -> String {
+        var scalars: [Unicode.Scalar] = []
+        scalars.reserveCapacity(value.unicodeScalars.count)
+        for scalar in value.unicodeScalars {
+            scalars.append(foldedScalar(scalar))
+        }
+        return String(String.UnicodeScalarView(scalars))
+    }
+
+    private static func foldedScalar(_ scalar: Unicode.Scalar) -> Unicode.Scalar {
+        switch scalar.value {
+        case 0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2212, 0xFE58, 0xFE63, 0xFF0D:
+            return Unicode.Scalar(0x2D)!
+        case 0x2018, 0x2019, 0x201A, 0x201B:
+            return Unicode.Scalar(0x27)!
+        case 0x201C, 0x201D, 0x201E, 0x201F:
+            return Unicode.Scalar(0x22)!
+        case 0xFF01...0xFF5E:
+            return Unicode.Scalar(scalar.value - 0xFEE0) ?? scalar
+        default:
+            return scalar
+        }
+    }
+
+    /// One console line per distinct normalization. The line is counts and code
+    /// points only, so a secret never appears in the log.
+    private static func logNormalizationIfNeeded(raw: String, sent: String) {
+        guard raw != sent else { return }
+        let line = "PlaidCredentialText normalized before use; sent sha256:\(sha256Prefix(sent)) raw \(anomalySummary(raw)); sent \(anomalySummary(sent))"
+        guard loggedNormalizations.insert(line).inserted else { return }
+        if loggedNormalizations.count > 32 {
+            loggedNormalizations.removeAll()
+            loggedNormalizations.insert(line)
+        }
+        print(line)
     }
 
     /// The fixed environment tag of a Plaid access token, not its unique id.
@@ -49,14 +154,35 @@ struct PlaidCredentials {
     let source: String
 
     /// Safe to log and show in the UI. Includes no secret and no access-token id.
-    func debugSummary(environment: PlaidEnvironment, url: URL, sendsAccessToken: Bool) -> String {
+    func debugSummary(
+        environment: PlaidEnvironment,
+        url: URL,
+        sendsAccessToken: Bool,
+        bodyKeys: [String] = [],
+        normalizationNotes: [String] = []
+    ) -> String {
         let token: String
         if sendsAccessToken {
-            token = "len \(accessToken.count), kind \(PlaidCredentialText.accessTokenKind(accessToken))"
+            token = "\(PlaidCredentialText.anomalySummary(accessToken)), kind \(PlaidCredentialText.accessTokenKind(accessToken))"
         } else {
             token = "not sent"
         }
-        return "slot \(source), client_id \(PlaidCredentialText.clientIdLabel(clientId)), secret len \(secret.count), access token \(token), \(url.absoluteString)"
+        var parts = [
+            "slot \(source)",
+            PlaidCredentialText.fingerprintLine(clientId, label: "client_id", revealPrefix: true),
+            PlaidCredentialText.fingerprintLine(secret, label: "secret", revealPrefix: false),
+            "access token \(token)",
+            url.absoluteString,
+            "app header Content-Type application/json",
+            "no PLAID-CLIENT-ID",
+            "no PLAID-SECRET",
+            "no Plaid-Version"
+        ]
+        if !bodyKeys.isEmpty {
+            parts.append("body keys \(bodyKeys.joined(separator: ","))")
+        }
+        parts.append(contentsOf: normalizationNotes)
+        return parts.joined(separator: ", ")
     }
 }
 
@@ -186,6 +312,7 @@ struct PlaidAPIError: Codable, Error, LocalizedError {
 enum PlaidClientError: Error, LocalizedError {
     case invalidResponse(environment: PlaidEnvironment)
     case http(status: Int, body: String, environment: PlaidEnvironment)
+    case credentialEncodingMismatch(environment: PlaidEnvironment, summary: String)
 
     var errorDescription: String? {
         switch self {
@@ -193,7 +320,25 @@ enum PlaidClientError: Error, LocalizedError {
             return "\(environment.displayName): Invalid response from Plaid"
         case .http(let status, let body, let environment):
             return "\(environment.displayName): Plaid HTTP \(status): \(body)"
+        case .credentialEncodingMismatch(let environment, let summary):
+            return "\(environment.displayName): JSON encoding changed client_id or secret, so the request was not sent. \(summary)"
         }
+    }
+}
+
+/// Placeholder curl for the credential probe. The command never contains a
+/// real client_id or secret; the owner pastes those locally and compares hashes.
+enum PlaidProbeCurl {
+    static func placeholderCommand(for environment: PlaidEnvironment) -> String {
+        let url = environment.baseURL.appendingPathComponent("institutions/get").absoluteString
+        return """
+        curl -sS -X POST '\(url)' \\
+          -H 'Content-Type: application/json' \\
+          -d '{"client_id":"CLIENT_ID","secret":"SECRET","count":1,"offset":0,"country_codes":["US"]}'
+        # Compare the app secret sha256 (first 8 hex) with:
+        # printf %s 'SECRET' | shasum -a 256
+        # Do not use echo; it adds a newline and changes the hash.
+        """
     }
 }
 
@@ -626,35 +771,65 @@ struct PlaidClient {
 
     /// POST `body` (with credentials injected) to `path` and decode the reply.
     /// Credentials go in the JSON body (`client_id`, `secret`), which is what
-    /// `https://sandbox.plaid.com/institutions/get` accepts. Headers are not used.
+    /// `https://sandbox.plaid.com/institutions/get` accepts. `PLAID-CLIENT-ID`,
+    /// `PLAID-SECRET`, and `Plaid-Version` are not set; a working curl does not
+    /// send them either.
     private func post<T: Decodable>(_ path: String, body: [String: Any], sendsAccessToken: Bool = true) async throws -> T {
         guard let url = endpointURL(path) else {
             throw PlaidClientError.invalidResponse(environment: environment)
         }
-        let clientId = PlaidCredentialText.normalized(credentials.clientId)
-        let secret = PlaidCredentialText.normalized(credentials.secret)
-        let summary = PlaidCredentials(
-            clientId: clientId,
-            secret: secret,
-            accessToken: credentials.accessToken,
-            source: credentials.source
-        ).debugSummary(environment: environment, url: url, sendsAccessToken: sendsAccessToken)
-        // Safe fields only: client_id prefix and lengths. Never the secret or token id.
-        let line = "Plaid \(environment.rawValue) POST \(summary)"
-        print(line)
-        log.info("\(line, privacy: .public)")
+        let rawClientId = credentials.clientId
+        let rawSecret = credentials.secret
+        let clientId = PlaidCredentialText.normalized(rawClientId)
+        let secret = PlaidCredentialText.normalized(rawSecret)
+        let accessToken = PlaidCredentialText.normalized(credentials.accessToken)
+        var notes: [String] = []
+        if rawClientId != clientId {
+            notes.append("client_id normalized before send; raw \(PlaidCredentialText.anomalySummary(rawClientId))")
+        }
+        if rawSecret != secret {
+            notes.append("secret normalized before send; raw \(PlaidCredentialText.anomalySummary(rawSecret))")
+        }
 
         var payload = body
         payload["client_id"] = clientId
         payload["secret"] = secret
         if sendsAccessToken {
-            payload["access_token"] = PlaidCredentialText.normalized(credentials.accessToken)
+            payload["access_token"] = accessToken
+        } else {
+            payload.removeValue(forKey: "access_token")
         }
+        let bodyKeys = payload.keys.map { String(describing: $0) }.sorted()
+        let summary = PlaidCredentials(
+            clientId: clientId,
+            secret: secret,
+            accessToken: accessToken,
+            source: credentials.source
+        ).debugSummary(
+            environment: environment,
+            url: url,
+            sendsAccessToken: sendsAccessToken,
+            bodyKeys: bodyKeys,
+            normalizationNotes: notes
+        )
+        // Safe fields only: hashes, lengths, and code points. Never the secret or token id.
+        let line = "Plaid \(environment.rawValue) POST \(summary)"
+        print(line)
+        log.info("\(line, privacy: .public)")
+        let nonASCII = "Plaid non-ASCII detection client_id \(PlaidCredentialText.codePointList(clientId, where: { $0.value > 127 })) secret \(PlaidCredentialText.codePointList(secret, where: { $0.value > 127 }))"
+        print(nonASCII)
+        log.info("\(nonASCII, privacy: .public)")
+
+        let encoded = try jsonBody(payload, clientId: clientId, secret: secret, accessToken: sendsAccessToken ? accessToken : nil, summary: summary)
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        request.setValue(nil, forHTTPHeaderField: "PLAID-CLIENT-ID")
+        request.setValue(nil, forHTTPHeaderField: "PLAID-SECRET")
+        request.setValue(nil, forHTTPHeaderField: "Plaid-Version")
+        request.setValue(nil, forHTTPHeaderField: "PLAID-VERSION")
+        request.httpBody = encoded
 
         let (data, response) = try await session.data(for: request)
 
@@ -677,6 +852,26 @@ struct PlaidClient {
         }
 
         return try decoder.decode(T.self, from: data)
+    }
+
+    /// Encodes `payload` and refuses to send if `client_id` or `secret` is not
+    /// the same string after a JSON parse. Slashes stay as `/`, matching curl.
+    private func jsonBody(
+        _ payload: [String: Any],
+        clientId: String,
+        secret: String,
+        accessToken: String?,
+        summary: String
+    ) throws -> Data {
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes])
+        let parsed = try JSONSerialization.jsonObject(with: data)
+        guard let object = parsed as? [String: Any],
+              (object["client_id"] as? String) == clientId,
+              (object["secret"] as? String) == secret,
+              accessToken == nil || (object["access_token"] as? String) == accessToken else {
+            throw PlaidClientError.credentialEncodingMismatch(environment: environment, summary: summary)
+        }
+        return data
     }
 
     /// Path join that keeps `/transactions/sync` as a real path. `appendingPathComponent`
