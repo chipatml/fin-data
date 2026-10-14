@@ -2,7 +2,7 @@
 //  GCSClient.swift
 //  FinAgentMenuBar
 //
-//  Google Cloud Storage JSON API. Object names keep the Drive layout:
+//  Google Cloud Storage JSON API. Object names follow the local day-file layout:
 //  `<prefix>/<YYYY-MM-DD>/<Label>.json`.
 //
 

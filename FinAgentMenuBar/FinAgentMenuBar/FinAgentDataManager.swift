@@ -107,7 +107,7 @@ class FinAgentDataManager: ObservableObject {
     static let shared = FinAgentDataManager()
 
     private let apiManager = APIKeyManager.shared
-    /// Cloud Storage is the default mirror. Drive remains in the project for a one-time copy.
+    /// Cloud Storage mirror for the local day-file tree.
     let cloudSync = GCSSync.shared
     /// Read on every request from the environment saved with the credentials,
     /// so an update applies on the next pull without restarting the app.
@@ -197,6 +197,35 @@ class FinAgentDataManager: ObservableObject {
         isBackgroundActive = UserDefaults.standard.object(forKey: backgroundEnabledKey) as? Bool ?? true
 
         sweepOrphanedData()
+        purgeLegacyDriveStorage()
+    }
+
+    /// Drop Google Drive Keychain items and UserDefaults left by older builds.
+    /// Best-effort and silent. Runs once; deleting a missing item is success.
+    private func purgeLegacyDriveStorage() {
+        let doneKey = "com.mlaid.finagent.gdrive.legacy_removed"
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: doneKey) else { return }
+
+        for account in [
+            "com.mlaid.finagent.gdrive.client_id",
+            "com.mlaid.finagent.gdrive.client_secret",
+            "com.mlaid.finagent.gdrive.refresh_token",
+        ] {
+            apiManager.deleteSecret(account: account)
+        }
+        for key in [
+            "com.mlaid.finagent.gdrive.account_email",
+            "com.mlaid.finagent.gdrive.enabled",
+            "com.mlaid.finagent.gdrive.folder_name",
+            "com.mlaid.finagent.gdrive.pending",
+            "com.mlaid.finagent.gdrive.folder_ids",
+            "com.mlaid.finagent.gdrive.file_ids",
+            "com.mlaid.finagent.gdrive.last_sync",
+        ] {
+            defaults.removeObject(forKey: key)
+        }
+        defaults.set(true, forKey: doneKey)
     }
 
     /// Error code and message only. Response bodies from Link can contain tokens.
@@ -630,19 +659,14 @@ class FinAgentDataManager: ObservableObject {
     }
 
     /// Delete shared credentials + every token, then clear all local data.
-    /// The Drive grant and the Cloud Storage service-account key go too.
+    /// The Cloud Storage service-account key goes too.
     func resetAll() async {
         stopAutoRotate()
-        // Revoke Drive while the session can still decrypt the refresh token,
-        // and before the sweep queues deletions against an account we're leaving.
-        await GoogleDriveAuth.shared.reset()
-        GoogleDriveSync.shared.isEnabled = false
         GCSAuth.shared.clear()
         cloudSync.isEnabled = false
         await apiManager.deleteKeys()
         sweepOrphanedData() // tokenEntries is now empty, so this clears everything
         // After the sweep, so the deletions it queues don't outlive the reset.
-        GoogleDriveSync.shared.reset()
         cloudSync.reset()
     }
 
