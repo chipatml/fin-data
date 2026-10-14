@@ -119,6 +119,11 @@ class FinAgentDataManager: ObservableObject {
     @Published var isRefreshing = false
     @Published var isResyncing = false
     @Published var isBackgroundActive = false
+    @Published var isLinking = false
+    @Published var linkStatus = ""
+    @Published var linkError: String?
+    private var linkTask: Task<Void, Never>?
+    private var linkGeneration = 0
     /// Latest snapshot per access token, keyed/ordered by token entry.
     @Published var snapshots: [LabeledSnapshot] = []
 
@@ -194,10 +199,26 @@ class FinAgentDataManager: ObservableObject {
         sweepOrphanedData()
     }
 
+    /// Error code and message only. Response bodies from Link can contain tokens.
+    private static func plaidErrorCode(_ error: Error) -> String {
+        if let api = error as? PlaidAPIError {
+            return "\(api.errorCode ?? "?") \(api.errorMessage ?? "")"
+        }
+        if let localized = error as? LocalizedError, let text = localized.errorDescription {
+            return text
+        }
+        return "request failed"
+    }
+
     /// User-facing Plaid failure text, including the host that was called.
-    private func describe(_ error: Error) -> String {
-        let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-        let prefix = "\(environment.displayName):"
+    private func describe(_ error: Error, environment host: PlaidEnvironment? = nil) -> String {
+        let text: String
+        if let localized = error as? LocalizedError, let description = localized.errorDescription {
+            text = description
+        } else {
+            text = "The request failed."
+        }
+        let prefix = "\((host ?? environment).displayName):"
         if text.hasPrefix(prefix) { return text }
         return "\(prefix) \(text)"
     }
@@ -241,9 +262,10 @@ class FinAgentDataManager: ObservableObject {
 
         for entry in entries {
             var labeled = LabeledSnapshot(id: entry.id, label: entry.label)
+            let host = apiManager.environment(forTokenId: entry.id)
             do {
                 let credentials = try apiManager.credentials(forTokenId: entry.id)
-                let client = PlaidClient(credentials: credentials, environment: environment)
+                let client = PlaidClient(credentials: credentials, environment: host)
                 // Key check does not send the access token, so INVALID_API_KEYS
                 // here is the client_id/secret pair and not a bad token.
                 try await client.verifyClientCredentials()
@@ -252,9 +274,9 @@ class FinAgentDataManager: ObservableObject {
                 if !labeled.data.hardErrors.isEmpty { failureCount += 1 }
             } catch {
                 // Credential/decryption failure — the whole token can't be pulled.
-                labeled.errorMessage = describe(error)
+                labeled.errorMessage = describe(error, environment: host)
                 failureCount += 1
-                print("Plaid refresh error [\(entry.label)]: \(error)")
+                print("Plaid refresh error [\(entry.label)]: \(Self.plaidErrorCode(error))")
             }
             results.append(labeled)
             writeDaily(for: labeled, runDate: runDate, lastFetchedDay: lastDay)
@@ -369,7 +391,7 @@ class FinAgentDataManager: ObservableObject {
         if let api = error as? PlaidAPIError, api.isProductUnavailable {
             print("Skipped \(product) [\(tokenId)] — unavailable: \(api.errorCode ?? api.errorDescription ?? "")")
         } else {
-            print("Error fetching \(product) [\(tokenId)]: \(error)")
+            print("Error fetching \(product): \(Self.plaidErrorCode(error))")
         }
     }
 
@@ -678,6 +700,154 @@ class FinAgentDataManager: ObservableObject {
         Task { await cloudSync.flush(localRoot: root) }
     }
 
+    // MARK: - Hosted Link
+
+    /// Opens Plaid Hosted Link for the environment selected in the menu, then
+    /// polls until the browser session finishes or 30 minutes pass.
+    func startHostedLink() {
+        guard !isLinking else { return }
+        linkError = nil
+        linkStatus = "Starting \(environment.displayName) Hosted Link…"
+        isLinking = true
+        linkGeneration += 1
+        let generation = linkGeneration
+        linkTask = Task { [weak self] in
+            await self?.runHostedLink(generation: generation)
+        }
+    }
+
+    func cancelHostedLink() {
+        linkTask?.cancel()
+    }
+
+    private func runHostedLink(generation: Int) async {
+        let host = environment
+        var savedNames: [String] = []
+        defer {
+            guard linkGeneration == generation else { return }
+            isLinking = false
+            linkTask = nil
+        }
+        do {
+            let credentials = try apiManager.linkCredentials(for: host)
+            let client = PlaidClient(credentials: credentials, environment: host)
+            linkStatus = "Creating a \(host.displayName) link…"
+            let created = try await createHostedLinkSession(client: client, host: host)
+            let session = created.session
+            try Task.checkCancellation()
+            guard NSWorkspace.shared.open(session.url) else {
+                throw HostedLinkError.browserFailed(environment: host)
+            }
+            let deadline = hostedLinkDeadline(expiration: session.expiration)
+            let productNote = created.productNote.map { " \($0)" } ?? ""
+            linkStatus = "Opened \(host.displayName) in your browser. Finish signing in there.\(productNote)"
+            let started = Date()
+            var poll = HostedLinkPoll(finished: false, items: [])
+            while Date() < deadline {
+                try Task.checkCancellation()
+                poll = try await client.hostedLinkStatus(linkToken: session.linkToken)
+                if poll.finished { break }
+                let elapsed = Int(Date().timeIntervalSince(started))
+                let minutes = elapsed / 60
+                let seconds = elapsed % 60
+                linkStatus = "Waiting for \(host.displayName) in the browser… \(minutes):\(String(format: "%02d", seconds)).\(productNote)"
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+            try Task.checkCancellation()
+            if poll.finished && poll.items.isEmpty {
+                throw HostedLinkError.endedWithoutBank(environment: host)
+            }
+            if !poll.finished && poll.items.isEmpty {
+                throw HostedLinkError.timedOut(environment: host)
+            }
+            if !poll.finished {
+                linkStatus = "\(host.displayName) link window ended. Saving banks that were already connected."
+            }
+            var failures: [String] = []
+            for item in poll.items {
+                try Task.checkCancellation()
+                linkStatus = "Saving \(item.institutionName) on \(host.displayName)…"
+                do {
+                    let accessToken = try await client.exchangePublicToken(item.publicToken)
+                    let label = apiManager.uniqueTokenLabel(item.institutionName)
+                    if await apiManager.addAccessToken(label: label, token: accessToken, environment: host) != nil {
+                        savedNames.append(label)
+                    } else {
+                        failures.append("\(item.institutionName): \(apiManager.errorMessage ?? "could not store the access token")")
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let urlError as URLError where urlError.code == .cancelled {
+                    throw urlError
+                } catch {
+                    failures.append("\(item.institutionName): \(describe(error, environment: host))")
+                }
+            }
+            if savedNames.isEmpty {
+                linkError = failures.joined(separator: "\n")
+                linkStatus = "No bank was saved."
+                return
+            }
+            linkError = failures.isEmpty ? nil : failures.joined(separator: "\n")
+            let names = savedNames.joined(separator: ", ")
+            linkStatus = failures.isEmpty
+                ? "Saved \(names) on \(host.displayName)."
+                : "Saved \(names) on \(host.displayName). \(failures.count) connection(s) failed."
+            isLinking = false
+            await performPeriodicAPICall()
+            resumeBackgroundIfEnabled()
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            linkError = nil
+            if savedNames.isEmpty {
+                linkStatus = "Link cancelled. No bank was saved."
+            } else {
+                linkStatus = "Link cancelled. Saved \(savedNames.joined(separator: ", ")) on \(host.displayName)."
+                isLinking = false
+                await performPeriodicAPICall()
+                resumeBackgroundIfEnabled()
+            }
+        } catch is CancellationError {
+            linkError = nil
+            if savedNames.isEmpty {
+                linkStatus = "Link cancelled. No bank was saved."
+            } else {
+                linkStatus = "Link cancelled. Saved \(savedNames.joined(separator: ", ")) on \(host.displayName)."
+                isLinking = false
+                await performPeriodicAPICall()
+                resumeBackgroundIfEnabled()
+            }
+        } catch {
+            linkError = describe(error, environment: host)
+            linkStatus = "Link failed."
+            print("Hosted Link failed: \(Self.plaidErrorCode(error))")
+        }
+    }
+
+    /// Asks for transactions plus the other products this app fetches. If Plaid
+    /// rejects an optional product the account is not enabled for, retries with
+    /// transactions only so a bank can still be linked.
+    private func createHostedLinkSession(client: PlaidClient, host: PlaidEnvironment) async throws -> (session: HostedLinkSession, productNote: String?) {
+        do {
+            let session = try await client.createHostedLink(clientUserId: apiManager.plaidClientUserId())
+            return (session, nil)
+        } catch let api as PlaidAPIError where api.errorCode == "INVALID_PRODUCT" || api.errorCode == "INVALID_FIELD" {
+            linkStatus = "\(describe(api, environment: host)) Retrying with transactions only."
+            let session = try await client.createHostedLink(
+                clientUserId: apiManager.plaidClientUserId(),
+                includeOptionalProducts: false
+            )
+            return (session, "This link requested transactions only.")
+        }
+    }
+
+    /// Public tokens are valid for about 30 minutes, which is also the default
+    /// Hosted Link URL lifetime when Plaid is not delivering the link.
+    private func hostedLinkDeadline(expiration: Date?) -> Date {
+        let halfHour = Date().addingTimeInterval(30 * 60)
+        guard let expiration else { return halfHour }
+        return min(expiration, halfHour)
+    }
+
     // MARK: - Access Token Rotation
 
     /// Rotate one token: invalidate the old token and persist the new one for
@@ -685,10 +855,11 @@ class FinAgentDataManager: ObservableObject {
     @discardableResult
     func rotateToken(id: String) async -> Bool {
         guard let entry = apiManager.tokenEntries.first(where: { $0.id == id }) else { return false }
+        let host = apiManager.environment(forTokenId: id)
         statusMessage = "Rotating \(entry.label)…"
         do {
             let credentials = try apiManager.credentials(forTokenId: id)
-            let client = PlaidClient(credentials: credentials, environment: environment)
+            let client = PlaidClient(credentials: credentials, environment: host)
 
             let newToken = try await client.rotateAccessToken()
             // Persist the new token before the old one is relied on again.
@@ -699,14 +870,14 @@ class FinAgentDataManager: ObservableObject {
             errorMessage = nil
             return true
         } catch let apiError as PlaidAPIError {
-            errorMessage = "\(entry.label): \(describe(apiError))"
+            errorMessage = "\(entry.label): \(describe(apiError, environment: host))"
             statusMessage = "Rotation failed"
             print("Rotation error [\(entry.label)]: \(apiError.errorCode ?? "?") — \(apiError.errorMessage ?? "")")
             return false
         } catch {
-            errorMessage = "\(entry.label): \(describe(error))"
+            errorMessage = "\(entry.label): \(describe(error, environment: host))"
             statusMessage = "Rotation failed"
-            print("Rotation error [\(entry.label)]: \(error)")
+            print("Rotation error [\(entry.label)]: \(Self.plaidErrorCode(error))")
             return false
         }
     }

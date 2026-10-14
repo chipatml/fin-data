@@ -216,12 +216,22 @@ class APIKeyManager: ObservableObject {
     }
 
     // MARK: - Access Tokens (multiple, each labeled)
+    /// Institution names can repeat. The stored label stays unique without adding account numbers.
+    func uniqueTokenLabel(_ base: String) -> String {
+        let existing = Set(tokenEntries.map(\.label))
+        if !existing.contains(base) { return base }
+        var suffix = 2
+        while existing.contains("\(base) \(suffix)") { suffix += 1 }
+        return "\(base) \(suffix)"
+    }
+
     /// Adds a labeled access token, returning its generated id.
+    /// `environment` tags the token so later pulls use that host and its client_id/secret.
     @discardableResult
-    func addAccessToken(label: String, token: String) async -> String? {
+    func addAccessToken(label: String, token: String, environment: PlaidEnvironment? = nil) async -> String? {
         do {
             let symmetricKey = try currentSymmetricKey()
-            let entry = PlaidTokenEntry(label: label)
+            let entry = PlaidTokenEntry(label: label, environment: environment)
             let trimmedToken = Self.trimmedCredential(token)
             guard !trimmedToken.isEmpty else {
                 errorMessage = "Enter an access token."
@@ -535,11 +545,44 @@ class APIKeyManager: ObservableObject {
         return key
     }
 
-    /// Decrypts the credentials for the selected environment plus the token for `id`.
+    /// Host for this token. Untagged tokens still use the environment selected in the menu.
+    func environment(forTokenId id: String) -> PlaidEnvironment {
+        tokenEntries.first { $0.id == id }?.plaidEnvironment ?? plaidEnvironment
+    }
+
+    /// Stable Plaid `user.client_user_id` for this Mac. Not a secret and not PII.
+    func plaidClientUserId() -> String {
+        let key = "com.mlaid.finagent.plaid.client_user_id"
+        if let existing = UserDefaults.standard.string(forKey: key),
+           existing.count >= 8,
+           existing.count <= 128,
+           existing.unicodeScalars.allSatisfy({ scalar in
+               scalar.value < 128 && !CharacterSet.whitespacesAndNewlines.contains(scalar)
+           }) {
+            return existing
+        }
+        let created = UUID().uuidString
+        UserDefaults.standard.set(created, forKey: key)
+        return created
+    }
+
+    /// client_id and secret for `environment`, with no access token. Used by Hosted Link.
+    func linkCredentials(for environment: PlaidEnvironment) throws -> PlaidCredentials {
+        let symmetricKey = try currentSymmetricKey()
+        let pair = try credentialPair(for: environment, using: symmetricKey)
+        return PlaidCredentials(
+            clientId: pair.clientId,
+            secret: pair.secret,
+            accessToken: "",
+            source: pair.source
+        )
+    }
+
+    /// Decrypts the credentials for the token's environment plus the token for `id`.
     /// Read on every request, so an update applies without restarting the app.
     func credentials(forTokenId id: String) throws -> PlaidCredentials {
         let symmetricKey = try currentSymmetricKey()
-        let pair = try credentialPair(for: plaidEnvironment, using: symmetricKey)
+        let pair = try credentialPair(for: environment(forTokenId: id), using: symmetricKey)
         let accessToken = Self.trimmedCredential(
             try decrypt(account: accessTokenAccount(for: id), using: symmetricKey)
         )

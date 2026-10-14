@@ -191,10 +191,23 @@ struct PlaidCredentials {
 struct PlaidTokenEntry: Codable, Identifiable, Hashable {
     let id: String
     var label: String
+    /// `sandbox` or `production` for tokens saved with a known host.
+    /// Nil on tokens added before environments were stored; those follow the
+    /// environment currently selected in the menu.
+    var environment: String?
 
-    init(id: String = UUID().uuidString, label: String) {
+    init(id: String = UUID().uuidString, label: String, environment: PlaidEnvironment? = nil) {
         self.id = id
         self.label = label
+        self.environment = environment?.rawValue
+    }
+
+    var plaidEnvironment: PlaidEnvironment? {
+        guard let environment, let parsed = PlaidEnvironment(rawValue: environment),
+              PlaidEnvironment.settingsChoices.contains(parsed) else {
+            return nil
+        }
+        return parsed
     }
 }
 
@@ -748,6 +761,98 @@ struct PlaidClient {
         try await post("/liabilities/get", body: [:])
     }
 
+    /// Starts a Hosted Link session for this client's environment. The returned
+    /// link token and URL are credentials for that session; callers must not log them.
+    func createHostedLink(clientUserId: String, includeOptionalProducts: Bool = true) async throws -> HostedLinkSession {
+        let end = Date()
+        let start = Calendar(identifier: .gregorian).date(byAdding: .day, value: -730, to: end) ?? end
+        var body: [String: Any] = [
+            "client_name": "FinAgent",
+            "language": "en",
+            "country_codes": ["US"],
+            "user": ["client_user_id": clientUserId],
+            "products": ["transactions"],
+            "transactions": ["days_requested": 730],
+            "hosted_link": [String: String]()
+        ]
+        if includeOptionalProducts {
+            body["optional_products"] = ["investments", "liabilities", "statements"]
+            body["statements"] = [
+                "start_date": Self.plaidDay(start),
+                "end_date": Self.plaidDay(end)
+            ]
+        }
+        let response: LinkTokenCreateResponse = try await post(
+            "/link/token/create",
+            body: body,
+            sendsAccessToken: false,
+            omitsResponseBody: true
+        )
+        guard let rawURL = response.hostedLinkURL, let url = URL(string: rawURL), Self.isPlaidHostedLinkURL(url) else {
+            throw HostedLinkError.missingURL(environment: environment)
+        }
+        guard !response.linkToken.isEmpty else {
+            throw HostedLinkError.missingURL(environment: environment)
+        }
+        return HostedLinkSession(
+            url: url,
+            linkToken: response.linkToken,
+            expiration: Self.parsePlaidDate(response.expiration)
+        )
+    }
+
+    /// One poll of `/link/token/get`. Public tokens stay inside the returned
+    /// items and are not logged.
+    func hostedLinkStatus(linkToken: String) async throws -> HostedLinkPoll {
+        let response: LinkTokenGetResponse = try await post(
+            "/link/token/get",
+            body: ["link_token": linkToken],
+            sendsAccessToken: false,
+            logsRequest: false,
+            omitsResponseBody: true
+        )
+        return HostedLinkPoll.parse(response)
+    }
+
+    /// Exchanges one public token. The access token in the result must not be logged.
+    func exchangePublicToken(_ publicToken: String) async throws -> String {
+        let response: PublicTokenExchangeResponse = try await post(
+            "/item/public_token/exchange",
+            body: ["public_token": publicToken],
+            sendsAccessToken: false,
+            logsRequest: false,
+            omitsResponseBody: true
+        )
+        let accessToken = PlaidCredentialText.normalized(response.accessToken)
+        guard !accessToken.isEmpty else {
+            throw HostedLinkError.exchangeEmpty(environment: environment)
+        }
+        return accessToken
+    }
+
+    private static func isPlaidHostedLinkURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https", let host = url.host?.lowercased() else { return false }
+        return host == "plaid.com" || host.hasSuffix(".plaid.com")
+    }
+
+    private static func plaidDay(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    private static func parsePlaidDate(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: value)
+    }
+
     /// Confirms client_id and secret with Plaid before any access token is sent.
     /// `/institutions/get` checks the key pair and does not take an access token,
     /// so a failure here is INVALID_API_KEYS rather than a bad token.
@@ -774,7 +879,13 @@ struct PlaidClient {
     /// `https://sandbox.plaid.com/institutions/get` accepts. `PLAID-CLIENT-ID`,
     /// `PLAID-SECRET`, and `Plaid-Version` are not set; a working curl does not
     /// send them either.
-    private func post<T: Decodable>(_ path: String, body: [String: Any], sendsAccessToken: Bool = true) async throws -> T {
+    private func post<T: Decodable>(
+        _ path: String,
+        body: [String: Any],
+        sendsAccessToken: Bool = true,
+        logsRequest: Bool = true,
+        omitsResponseBody: Bool = false
+    ) async throws -> T {
         guard let url = endpointURL(path) else {
             throw PlaidClientError.invalidResponse(environment: environment)
         }
@@ -813,12 +924,15 @@ struct PlaidClient {
             normalizationNotes: notes
         )
         // Safe fields only: hashes, lengths, and code points. Never the secret or token id.
-        let line = "Plaid \(environment.rawValue) POST \(summary)"
-        print(line)
-        log.info("\(line, privacy: .public)")
-        let nonASCII = "Plaid non-ASCII detection client_id \(PlaidCredentialText.codePointList(clientId, where: { $0.value > 127 })) secret \(PlaidCredentialText.codePointList(secret, where: { $0.value > 127 }))"
-        print(nonASCII)
-        log.info("\(nonASCII, privacy: .public)")
+        // Link polling skips this line so a 30-minute wait does not reprint credentials.
+        if logsRequest {
+            let line = "Plaid \(environment.rawValue) POST \(summary)"
+            print(line)
+            log.info("\(line, privacy: .public)")
+            let nonASCII = "Plaid non-ASCII detection client_id \(PlaidCredentialText.codePointList(clientId, where: { $0.value > 127 })) secret \(PlaidCredentialText.codePointList(secret, where: { $0.value > 127 }))"
+            print(nonASCII)
+            log.info("\(nonASCII, privacy: .public)")
+        }
 
         let encoded = try jsonBody(payload, clientId: clientId, secret: secret, accessToken: sendsAccessToken ? accessToken : nil, summary: summary)
 
@@ -847,7 +961,7 @@ struct PlaidClient {
                 log.error("\(failure, privacy: .public)")
                 throw apiError
             }
-            let bodyText = String(data: data, encoding: .utf8) ?? "<no body>"
+            let bodyText = omitsResponseBody ? "response omitted" : (String(data: data, encoding: .utf8) ?? "<no body>")
             throw PlaidClientError.http(status: http.statusCode, body: bodyText, environment: environment)
         }
 
@@ -893,3 +1007,171 @@ struct PlaidClient {
 
 /// Decodes a JSON object while ignoring its keys. Used for the credential probe.
 private struct EmptyJSONObject: Decodable {}
+
+/// A Hosted Link session. `linkToken` and `url` grant access to that session
+/// for its lifetime. Do not log, persist, or put them in UI text.
+struct HostedLinkSession {
+    let url: URL
+    let linkToken: String
+    let expiration: Date?
+}
+
+/// One bank the user added. `publicToken` is exchanged immediately and never logged.
+struct HostedLinkAddedItem {
+    let institutionName: String
+    let publicToken: String
+}
+
+struct HostedLinkPoll {
+    let finished: Bool
+    let items: [HostedLinkAddedItem]
+
+    fileprivate static func parse(_ response: LinkTokenGetResponse) -> HostedLinkPoll {
+        let sessions = response.linkSessions ?? []
+        let finished = !sessions.isEmpty && sessions.allSatisfy { session in
+            let stamp = session.finishedAt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return !stamp.isEmpty
+        }
+        var items: [HostedLinkAddedItem] = []
+        var seen: Set<String> = []
+        for session in sessions {
+            let added = session.results?.itemAddResults ?? []
+            if !added.isEmpty {
+                for result in added {
+                    appendItem(
+                        publicToken: result.publicToken,
+                        institutionName: result.institution?.name,
+                        into: &items,
+                        seen: &seen
+                    )
+                }
+            } else {
+                appendItem(
+                    publicToken: session.onSuccess?.publicToken,
+                    institutionName: session.onSuccess?.metadata?.institution?.name,
+                    into: &items,
+                    seen: &seen
+                )
+            }
+        }
+        return HostedLinkPoll(finished: finished, items: items)
+    }
+
+    private static func appendItem(
+        publicToken: String?,
+        institutionName: String?,
+        into items: inout [HostedLinkAddedItem],
+        seen: inout Set<String>
+    ) {
+        let token = PlaidCredentialText.normalized(publicToken ?? "")
+        guard !token.isEmpty, seen.insert(token).inserted else { return }
+        items.append(HostedLinkAddedItem(institutionName: institutionLabel(institutionName), publicToken: token))
+    }
+
+    private static func institutionLabel(_ raw: String?) -> String {
+        let flattened = (raw ?? "").replacingOccurrences(of: "\n", with: " ")
+        let trimmed = flattened.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Linked bank" }
+        if trimmed.count > 80 { return String(trimmed.prefix(80)) }
+        return trimmed
+    }
+}
+
+enum HostedLinkError: Error, LocalizedError {
+    case missingURL(environment: PlaidEnvironment)
+    case exchangeEmpty(environment: PlaidEnvironment)
+    case endedWithoutBank(environment: PlaidEnvironment)
+    case timedOut(environment: PlaidEnvironment)
+    case browserFailed(environment: PlaidEnvironment)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingURL(let environment):
+            return "\(environment.displayName): Plaid did not return a hosted_link_url. Hosted Link was not started for this session."
+        case .exchangeEmpty(let environment):
+            return "\(environment.displayName): Plaid did not return an access token from public_token exchange."
+        case .endedWithoutBank(let environment):
+            return "\(environment.displayName): the link ended without a connected bank."
+        case .timedOut(let environment):
+            return "\(environment.displayName): the link timed out after 30 minutes. No bank was saved. Start Link a bank again."
+        case .browserFailed(let environment):
+            return "\(environment.displayName): the bank link could not be opened in the browser."
+        }
+    }
+}
+
+private struct LinkTokenCreateResponse: Decodable {
+    let hostedLinkURL: String?
+    let linkToken: String
+    let expiration: String?
+
+    enum CodingKeys: String, CodingKey {
+        case hostedLinkURL = "hosted_link_url"
+        case linkToken = "link_token"
+        case expiration
+    }
+}
+
+private struct LinkTokenGetResponse: Decodable {
+    let linkSessions: [LinkTokenSession]?
+
+    enum CodingKeys: String, CodingKey {
+        case linkSessions = "link_sessions"
+    }
+}
+
+private struct LinkTokenSession: Decodable {
+    let finishedAt: String?
+    let results: LinkTokenSessionResults?
+    let onSuccess: LinkTokenOnSuccess?
+
+    enum CodingKeys: String, CodingKey {
+        case finishedAt = "finished_at"
+        case results
+        case onSuccess = "on_success"
+    }
+}
+
+private struct LinkTokenSessionResults: Decodable {
+    let itemAddResults: [LinkTokenItemAdd]?
+
+    enum CodingKeys: String, CodingKey {
+        case itemAddResults = "item_add_results"
+    }
+}
+
+private struct LinkTokenItemAdd: Decodable {
+    let publicToken: String?
+    let institution: LinkTokenInstitution?
+
+    enum CodingKeys: String, CodingKey {
+        case publicToken = "public_token"
+        case institution
+    }
+}
+
+private struct LinkTokenOnSuccess: Decodable {
+    let publicToken: String?
+    let metadata: LinkTokenSuccessMetadata?
+
+    enum CodingKeys: String, CodingKey {
+        case publicToken = "public_token"
+        case metadata
+    }
+}
+
+private struct LinkTokenSuccessMetadata: Decodable {
+    let institution: LinkTokenInstitution?
+}
+
+private struct LinkTokenInstitution: Decodable {
+    let name: String?
+}
+
+private struct PublicTokenExchangeResponse: Decodable {
+    let accessToken: String
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+    }
+}

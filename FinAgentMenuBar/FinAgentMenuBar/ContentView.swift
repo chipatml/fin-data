@@ -238,6 +238,7 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            hostedLinkControls
             tokenList
             addTokenForm
 
@@ -995,7 +996,7 @@ struct ContentView: View {
                 .font(.subheadline).bold()
 
             if apiManager.tokenEntries.isEmpty {
-                Text("None yet — add one below.")
+                Text("None yet. Use Link a bank, or paste a token below.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             } else {
@@ -1015,6 +1016,11 @@ struct ContentView: View {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(entry.label)
                                     .font(.callout).bold()
+                                if let host = entry.plaidEnvironment {
+                                    Text(host.displayName)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
                                 if let snap { compactSummary(snap) }
                             }
                             Spacer()
@@ -1051,6 +1057,41 @@ struct ContentView: View {
         }
     }
 
+    private var hostedLinkControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button(manager.isLinking ? "Linking…" : "Link a bank (Hosted Link)") {
+                manager.startHostedLink()
+            }
+            .disabled(manager.isLinking)
+            .help("Opens Plaid in the browser for \(apiManager.plaidEnvironment.displayName) and waits up to 30 minutes.")
+
+            Text("Uses \(apiManager.plaidEnvironment.displayName) (\(apiManager.plaidEnvironment.hostDescription)). Change that under Update client_id / secret, then save.")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if manager.isLinking || !manager.linkStatus.isEmpty {
+                Text(manager.linkStatus)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            if manager.isLinking {
+                Button("Cancel link", role: .cancel) {
+                    manager.cancelHostedLink()
+                }
+            }
+            if let linkError = manager.linkError {
+                Text(linkError)
+                    .font(.caption2)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
     private var addTokenForm: some View {
         VStack(alignment: .leading, spacing: 6) {
             TextField("Label (e.g. Chase Checking)", text: $tokenLabelInput)
@@ -1058,8 +1099,9 @@ struct ContentView: View {
             SecureField("access_token", text: $tokenValueInput)
                 .textFieldStyle(.roundedBorder)
             Button("Add Access Token") {
+                let environment = apiManager.plaidEnvironment
                 Task {
-                    await apiManager.addAccessToken(label: tokenLabelInput, token: tokenValueInput)
+                    await apiManager.addAccessToken(label: tokenLabelInput, token: tokenValueInput, environment: environment)
                     tokenLabelInput = ""
                     tokenValueInput = ""
                     // Pull immediately so the new token's data appears.
