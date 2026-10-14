@@ -9,12 +9,17 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 
 /// Live NSTextField values, keyed by form field. Weak so a dismissed field
 /// does not stay in memory; the button reads it on the click, before dismiss.
 @MainActor
 final class PlainCredentialFieldRegistry: ObservableObject {
+    /// Required because this type publishes nothing. Without a stored publisher,
+    /// and without Combine, the compiler does not synthesize `objectWillChange`.
+    let objectWillChange = ObservableObjectPublisher()
+
     private var fields: [String: WeakField] = [:]
 
     func register(_ field: NSTextField, for key: String) {
@@ -140,7 +145,7 @@ struct PlainCredentialField: NSViewRepresentable {
         editor.isAutomaticSpellingCorrectionEnabled = false
         editor.isContinuousSpellCheckingEnabled = false
         editor.isGrammarCheckingEnabled = false
-        editor.enabledTextCheckingTypes = []
+        editor.enabledTextCheckingTypes = 0
         editor.smartInsertDeleteEnabled = false
         editor.isAutomaticTextCompletionEnabled = false
     }
