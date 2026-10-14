@@ -7,8 +7,6 @@ struct ContentView: View {
     @StateObject private var apiManager = APIKeyManager.shared
     @StateObject private var gcsAuth = GCSAuth.shared
     @StateObject private var gcsSync = GCSSync.shared
-    @StateObject private var driveAuth = GoogleDriveAuth.shared
-    @StateObject private var driveSync = GoogleDriveSync.shared
 
     // Shared credential inputs
     @State private var clientIdInput = ""
@@ -33,10 +31,6 @@ struct ContentView: View {
     @State private var replacementKeyJSON = ""
     @State private var importKeyFile = false
     @State private var importReplacementKey = false
-
-    // Google Drive OAuth client inputs
-    @State private var driveClientIdInput = ""
-    @State private var driveClientSecretInput = ""
 
     @State private var status: String = ""
 
@@ -281,11 +275,6 @@ struct ContentView: View {
 
             DisclosureGroup("Cloud Storage") {
                 cloudStorageControls
-            }
-            .font(.subheadline)
-
-            DisclosureGroup("Google Drive (legacy)") {
-                driveControls
             }
             .font(.subheadline)
 
@@ -593,7 +582,7 @@ struct ContentView: View {
             Button(gcsSync.isSyncing ? "Uploading…" : "Sync All to Cloud Storage") {
                 Task { await gcsSync.syncAll(localRoot: manager.dataDirectoryURL) }
             }
-            .disabled(gcsSync.isSyncing || gcsSync.isMigrating || !gcsSync.isEnabled)
+            .disabled(gcsSync.isSyncing || !gcsSync.isEnabled)
             .help("Upload every day file currently on disk, then retry anything still queued.")
 
             Button {
@@ -634,13 +623,7 @@ struct ContentView: View {
                 loadKeyFile(result, into: $replacementKeyJSON)
             }
 
-            Button(gcsSync.isMigrating ? "Copying…" : "Copy Drive files into the bucket") {
-                Task { await gcsSync.importFromDrive(localRoot: manager.dataDirectoryURL) }
-            }
-            .disabled(gcsSync.isMigrating || gcsSync.isSyncing || !driveAuth.isConnected)
-            .help("Uploads the local Data folder, then downloads any remaining day files from the connected Drive account.")
-
-            Text("If Drive is already disconnected, upload the local folder instead:")
+            Text("To copy an existing Data folder from Terminal:")
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -718,198 +701,6 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
             }
-            Text("Checked \(status.checkedAt.formatted(date: .omitted, time: .shortened))")
-                .foregroundColor(.secondary)
-        }
-        .font(.caption2)
-        .padding(6)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.08))
-        .cornerRadius(6)
-    }
-
-    // MARK: - Google Drive controls
-
-    private var driveControls: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if !driveAuth.isConfigured {
-                driveClientForm
-            } else if !driveAuth.isConnected {
-                Text("Sign in to pick the Google account that holds the data. Google shows its own login and consent page — this app never sees your password.")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Button(driveAuth.isConnecting ? "Waiting for Google…" : "Sign in with Google") {
-                    Task {
-                        await driveAuth.connect()
-                        if driveAuth.isConnected {
-                            driveSync.isEnabled = true
-                            await driveSync.syncAll(localRoot: manager.dataDirectoryURL)
-                        }
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(driveAuth.isConnecting)
-
-                if let clientId = GoogleOAuthConfig.displayClientId {
-                    Text("OAuth client \(Self.abbreviate(clientId))")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-                Button("Change OAuth Client", role: .destructive) {
-                    Task { await driveAuth.reset() }
-                }
-                .font(.caption)
-            } else {
-                driveConnectedControls
-            }
-
-            if let error = driveAuth.errorMessage ?? driveSync.errorMessage {
-                Text(error)
-                    .font(.caption2)
-                    .foregroundColor(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(.top, 4)
-    }
-
-    /// Shorten a client id for display: `1234-abcd….apps.googleusercontent.com`
-    /// is unreadable in a 320pt popover, and only the prefix identifies it.
-    private static func abbreviate(_ clientId: String) -> String {
-        let head = clientId.prefix(14)
-        return clientId.count > 14 ? "\(head)…" : String(head)
-    }
-
-    /// One-time entry of the Google Cloud "Desktop app" OAuth client. Needed
-    /// once because Google has no anonymous sign-in: the client id is what
-    /// names this app on the consent screen. After this it's sign-in only.
-    private var driveClientForm: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("One-time setup. In Google Cloud console, enable the Drive API and create an OAuth client of type **Desktop app**, then paste it here — after this, connecting is just a Google login.")
-                .font(.caption2)
-                .foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            TextField("client ID (…apps.googleusercontent.com)", text: $driveClientIdInput)
-                .textFieldStyle(.roundedBorder)
-            SecureField("client secret", text: $driveClientSecretInput)
-                .textFieldStyle(.roundedBorder)
-
-            Button("Save OAuth Client") {
-                driveAuth.configure(clientId: driveClientIdInput,
-                                    clientSecret: driveClientSecretInput)
-                driveClientSecretInput = ""
-            }
-            .disabled(driveClientIdInput.isEmpty || driveClientSecretInput.isEmpty)
-        }
-    }
-
-    private var driveConnectedControls: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label(driveAuth.statusMessage, systemImage: "checkmark.icloud")
-                .font(.caption)
-                .foregroundColor(.secondary)
-
-            Toggle("Upload day files to Drive", isOn: $driveSync.isEnabled)
-                .font(.caption)
-
-            HStack(spacing: 4) {
-                Text("Folder")
-                    .font(.caption)
-                TextField(GoogleDriveSync.defaultFolderName, text: $driveSync.folderName)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
-            }
-            Text("Drive: \(driveSync.folderName)/<YYYY-MM-DD>/<Label>.json — share that folder with whoever reads it.")
-                .font(.caption2)
-                .foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if driveSync.pendingCount > 0 {
-                Text("\(driveSync.pendingCount) file(s) waiting to upload")
-                    .font(.caption2)
-                    .foregroundColor(.orange)
-            } else if let last = driveSync.lastSync {
-                Text("Last upload: \(last.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-
-            Button(driveSync.isSyncing ? "Uploading…" : "Sync All to Drive") {
-                Task { await driveSync.syncAll(localRoot: manager.dataDirectoryURL) }
-            }
-            .disabled(driveSync.isSyncing || !driveSync.isEnabled)
-            .help("Upload every day file currently on disk, then retry anything still queued.")
-
-            Button {
-                Task { await driveSync.checkStatus(localRoot: manager.dataDirectoryURL) }
-            } label: {
-                Label(driveSync.isCheckingStatus ? "Checking…" : "Check Drive Status",
-                      systemImage: "stethoscope")
-            }
-            .disabled(driveSync.isCheckingStatus || driveSync.isSyncing)
-            .help("Compare the local day files against what's actually in the Drive folder.")
-
-            if let status = driveSync.status {
-                driveStatusReport(status)
-            }
-
-            Button("Disconnect Google Drive", role: .destructive) {
-                Task {
-                    await driveAuth.disconnect()
-                    driveSync.isEnabled = false
-                    driveSync.reset()
-                }
-            }
-            .font(.caption)
-        }
-    }
-
-    /// IN SYNC / OUT OF SYNC verdict from the last status check.
-    @ViewBuilder
-    private func driveStatusReport(_ status: GoogleDriveSync.Status) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if let error = status.errorMessage {
-                Label("Check failed", systemImage: "xmark.octagon.fill")
-                    .font(.caption).bold()
-                    .foregroundColor(.red)
-                Text(error)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if !status.folderExists {
-                Label("Folder not in Drive yet", systemImage: "questionmark.folder")
-                    .font(.caption).bold()
-                    .foregroundColor(.orange)
-                Text("“\(driveSync.folderName)” hasn’t been created — nothing has uploaded yet. \(status.localFiles) local file(s) waiting.")
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if status.inSync {
-                Label("IN SYNC", systemImage: "checkmark.seal.fill")
-                    .font(.caption).bold()
-                    .foregroundColor(.green)
-                Text("\(status.driveFiles) file(s) across \(status.driveDays) day(s) in Drive.")
-            } else {
-                Label("OUT OF SYNC", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption).bold()
-                    .foregroundColor(.orange)
-                Text("Local \(status.localFiles) file(s) / \(status.localDays) day(s) · Drive \(status.driveFiles) / \(status.driveDays)")
-                if !status.missing.isEmpty {
-                    Text("• \(status.missing.count) missing from Drive — “Sync All” uploads them")
-                        .foregroundColor(.orange)
-                }
-                if !status.extra.isEmpty {
-                    Text("• \(status.extra.count) extra in Drive with no local file")
-                }
-                if status.queued > 0 {
-                    Text("• \(status.queued) queued for the next upload")
-                }
-                // A couple of examples make a mismatch far easier to chase.
-                ForEach((status.missing + status.extra).prefix(3), id: \.self) { path in
-                    Text("   \(path)")
-                        .foregroundColor(.secondary)
-                }
-            }
-
             Text("Checked \(status.checkedAt.formatted(date: .omitted, time: .shortened))")
                 .foregroundColor(.secondary)
         }

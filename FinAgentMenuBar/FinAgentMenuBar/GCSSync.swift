@@ -2,15 +2,13 @@
 //  GCSSync.swift
 //  FinAgentMenuBar
 //
-//  Default remote mirror. The queue is the same shape as the Drive mirror:
-//  local files stay authoritative, and a failed upload is retried next pull.
+//  Remote mirror. Local files stay authoritative, and a failed upload is
+//  retried on the next pull.
 //
 //  Objects:
 //      gs://<bucket>/<prefix>/<YYYY-MM-DD>/<Label>.json
 //
-//  One-time copy from an existing Drive folder, when that account is still
-//  connected, is `importFromDrive`. Otherwise, from the Mac that holds the
-//  local Data folder:
+//  To copy an existing Data folder from another Mac:
 //
 //      gcloud storage rsync --recursive \
 //        "$HOME/Library/Application Support/FinAgentMenuBar/Data" \
@@ -21,14 +19,13 @@ import Foundation
 import Combine
 
 @MainActor
-final class GCSSync: ObservableObject, DayFileMirror {
+final class GCSSync: ObservableObject {
     static let shared = GCSSync()
     static let defaultPrefix = "FinAgentMenuBar"
 
     private let auth = GCSAuth.shared
 
     @Published private(set) var isSyncing = false
-    @Published private(set) var isMigrating = false
     @Published private(set) var pendingCount = 0
     @Published var lastSync: Date?
     @Published var statusMessage = ""
@@ -53,7 +50,7 @@ final class GCSSync: ObservableObject, DayFileMirror {
         }
     }
 
-    /// Object prefix that replaces the old Drive folder name.
+    /// Object prefix inside the bucket. Not a secret.
     @Published var prefix: String {
         didSet {
             guard prefix != oldValue else { return }
@@ -204,41 +201,6 @@ final class GCSSync: ObservableObject, DayFileMirror {
             markWritten(day: path.day, fileName: path.name)
         }
         await flush(localRoot: localRoot)
-    }
-
-    /// Upload the local tree, then copy any Drive day files that are not already
-    /// in the bucket. Drive must still be connected for the second step.
-    func importFromDrive(localRoot: URL) async {
-        guard !isMigrating, !isSyncing else { return }
-        isMigrating = true
-        defer { isMigrating = false }
-        errorMessage = nil
-
-        isEnabled = true
-        await syncAll(localRoot: localRoot)
-        if errorMessage != nil { return }
-
-        guard GoogleDriveAuth.shared.isConnected else {
-            statusMessage = "Local files uploaded. Drive is not connected, so nothing else was copied. Use the gcloud command for a machine that only has the Data folder."
-            return
-        }
-
-        do {
-            let client = try makeClient()
-            let remote = try await GoogleDriveSync.shared.downloadDayFiles()
-            var copied = 0
-            for file in remote {
-                let object = DayFileLayout.objectName(prefix: prefix, day: file.day, name: file.name)
-                try await client.upload(data: file.data, objectName: object)
-                copied += 1
-            }
-            statusMessage = copied == 0
-                ? "Drive folder had no day files to copy"
-                : "Copied \(copied) Drive file(s) into gs://\(bucketName)/\(prefix)"
-            errorMessage = nil
-        } catch {
-            report(error, context: "Drive copy")
-        }
     }
 
     func checkStatus(localRoot: URL) async {
