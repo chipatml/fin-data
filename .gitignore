@@ -19,6 +19,8 @@ credentials/
 **/service-account*.json
 **/*-credentials.json
 **/secrets.json
+# JSON keys minted by scripts/gcp (import into FinAgent, then delete)
+scripts/gcp/*.json
 *.postman_environment.json
 
 # Local financial dumps (tracked fixtures under bookkeeping-agent/samples stay committed)
